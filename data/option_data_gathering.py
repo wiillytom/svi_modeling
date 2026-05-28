@@ -15,7 +15,7 @@ TARGET_COLUMNS = [
     'option_type', 'instrument_id'
 ]
 
-def get_index_price(index_name: str = 'btc_usd') -> Optional[float]:
+def get_index_price(index_name: str = 'eth_usd') -> Optional[float]:
     """
     Fetches the current index price from Deribit.
     
@@ -37,7 +37,7 @@ def get_index_price(index_name: str = 'btc_usd') -> Optional[float]:
         print(f"Network or API error fetching index price: {e}")
         return None
 
-def get_book_summary(currency: str = 'BTC', kind: str = 'option') -> List[Dict[str, Any]]:
+def get_book_summary(currency: str = 'eth', kind: str = 'option') -> List[Dict[str, Any]]:
     """
     Fetches the market data summary for all instruments of a specific currency and kind.
     
@@ -115,7 +115,7 @@ def save_to_csv(df: pd.DataFrame) -> None:
         
     # Generate timestamped filename: eth_option_data_YYYY-MM-DD_HHhmm.csv
     timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%Mm")
-    filename = f"btc_option_data_{timestamp}.csv"
+    filename = f"eth_option_data_{timestamp}.csv"
     
     # Save to the current directory (or change to 'data/' if needed)
     path = r'/Users/macbookair/Internship Natixis/data/'
@@ -123,8 +123,8 @@ def save_to_csv(df: pd.DataFrame) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Saved data to {filename}")
 
 def run_job() -> None:
-    price_index = get_index_price('btc_usd')
-    book_summary = get_book_summary('BTC', 'option')
+    price_index = get_index_price('eth_usd')
+    book_summary = get_book_summary('eth', 'option')
     
     if price_index is not None and book_summary:
         df = process_data(book_summary, price_index)

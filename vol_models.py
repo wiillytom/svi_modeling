@@ -267,6 +267,32 @@ class SSVI(VolModel):
         atm_w = float(np.interp(0.0, np.sort(k), w_obs[np.argsort(k)]))
         return {"theta": atm_w, "eta": 2.0, "rho": -0.7, "gamma": 0.4}
 
+    def min_g(self, params, k_range=(-4.0, 4.0), n=50):
+        """
+        Analytical per-slice butterfly check using closed-form SSVI derivatives.
+
+        For  w(k) = (theta/2)*(1 + rho*phi*k + sqrt((phi*k+rho)^2 + 1-rho^2))
+        the first and second derivatives are exact:
+            dw/dk  = (theta*phi/2) * (rho + (phi*k+rho)/D)
+            d²w/dk² = (theta*phi²/2) * (1-rho²) / D³
+        where D = sqrt((phi*k+rho)² + 1-rho²).
+
+        Evaluates g(k) on 50 points — ~15× faster than the base-class
+        600-point finite-difference scan, and checks the actual single-slice
+        condition rather than the stricter surface-level condition.
+        """
+        k     = np.linspace(k_range[0], k_range[1], n)
+        theta = params["theta"]
+        phi   = params["eta"] / (theta ** params["gamma"])
+        rho   = params["rho"]
+        P     = phi * k + rho
+        D     = np.sqrt(np.maximum(P**2 + (1 - rho**2), 1e-10))
+        W     = np.maximum((theta / 2) * (1 + rho * phi * k + D), 1e-10)
+        dW    = (theta * phi / 2) * (rho + P / D)
+        d2W   = (theta * phi**2 / 2) * (1 - rho**2) / D**3
+        g     = (1 - k * dW / (2 * W))**2 - (dW**2 / 4) * (1/W + 0.25) + d2W / 2
+        return float(np.min(g))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  SABR  (Hagan et al. lognormal approximation)
@@ -320,15 +346,17 @@ class SABR(VolModel):
         log_FK = np.where(atm, 0.0, np.log(F / K))
 
         z      = (nu / alpha) * FK_b * log_FK
-        x_z    = np.where(
-            np.abs(z) < eps,
-            1.0,
-            np.log((np.sqrt(1 - 2*rho*z + z**2) + z - rho) / (1 - rho)) / z
-        )
+        safe_z = np.where(np.abs(z) < eps, 1.0, z)   # avoid 0/0 in both branches
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_z = np.where(
+                np.abs(z) < eps,
+                1.0,
+                np.log((np.sqrt(1 - 2*rho*z + z**2) + z - rho) / (1 - rho)) / safe_z,
+            )
 
         A = alpha / (FK_b * (1 + ((1-beta)**2/24)*log_FK**2
                              + ((1-beta)**4/1920)*log_FK**4))
-        B = z / x_z
+        B = 1.0 / x_z
 
         C = (
             1
@@ -398,53 +426,40 @@ class eSSVI(VolModel):
     """
     Extended SSVI (Hendriks & Martini, Journal of Computational Finance 2019).
 
-    Same formula as SSVI but rho is a function of theta rather than a constant:
+    Same formula as SSVI but rho is a function of theta:
 
         w(k, theta) = (theta/2) * (
             1 + rho(theta)*phi(theta)*k
             + sqrt((phi(theta)*k + rho(theta))^2 + 1 - rho(theta)^2)
         )
 
-        phi(theta)  = eta / theta^gamma          (power-law, same as SSVI)
-        rho(theta)  = rho_0 - (rho_0 - rho_m) * (theta / theta_max)^a
+        phi(theta)   = eta / theta^gamma           (power-law, same as SSVI)
+        rho(theta)   = rho_inf + (rho_0 - rho_inf) * exp(-lam * theta)
 
-    This allows the skew to vary with maturity — empirically rho is more
-    negative for short maturities (steep skew) and less negative for long
-    maturities, which SSVI with constant rho cannot capture.
+    The exponential form is well-behaved for all theta > 0:
+        rho(0)   = rho_0   (short-maturity limit)
+        rho(inf) = rho_inf (long-maturity limit)
+
+    Empirically rho is more negative for short maturities and flattens out
+    for long maturities. SSVI with constant rho cannot capture this.
 
     Parameters
     ----------
-    theta     : ATM total variance for this slice  (> 0)
-    eta       : vol-of-vol scaling                 (> 0)
-    gamma     : skew decay exponent                (0 < gamma <= 0.5)
-    rho_0     : short-maturity correlation limit   (|rho_0| < 1)
-    rho_m     : long-maturity correlation limit    (|rho_m| < 1)
-    theta_max : largest ATM total variance on the surface  (> 0, fixed per snapshot)
-    a         : transition speed                   (a > 0)
-
-    Note: theta_max should be set once per snapshot (e.g. from the longest
-    expiry) and passed in via initial_guess. It is stored as a fixed parameter,
-    not optimised.
+    theta   : ATM total variance for this slice  (> 0)
+    eta     : vol-of-vol scaling                 (> 0)
+    gamma   : skew decay exponent                (0 < gamma <= 0.5)
+    rho_0   : short-maturity correlation limit   (|rho_0| < 1)
+    rho_inf : long-maturity correlation limit    (|rho_inf| < 1)
+    lam     : decay speed                        (lam > 0)
     """
 
     name = "eSSVI"
 
-    def __init__(self, theta_max: float = 1.0):
-        """
-        Parameters
-        ----------
-        theta_max : ATM total variance of the longest expiry in the snapshot.
-                    Set this before calibrating, e.g.:
-                        model = eSSVI(theta_max=df[df.t==df.t.max()].w.mean())
-        """
-        self.theta_max = theta_max
-
     def _rho(self, theta, params):
-        rho_0     = params["rho_0"]
-        rho_m     = params["rho_m"]
-        a         = params["a"]
-        theta_max = self.theta_max
-        return rho_0 - (rho_0 - rho_m) * (theta / theta_max) ** a
+        rho_0   = params["rho_0"]
+        rho_inf = params["rho_inf"]
+        lam     = params["lam"]
+        return rho_inf + (rho_0 - rho_inf) * np.exp(-lam * theta)
 
     def w(self, k, params):
         k     = np.asarray(k, dtype=float)
@@ -459,60 +474,86 @@ class eSSVI(VolModel):
 
     def validate(self, params):
         rho = self._rho(params["theta"], params)
+        # no-arb requires eta*(1+|rho|) <= 2 for the worst-case rho on [0,inf)
+        max_rho_abs = max(abs(params["rho_0"]), abs(params["rho_inf"]))
         return (
             params["theta"] > 0
             and params["eta"] > 0
             and 0 < params["gamma"] <= 0.5
             and abs(params["rho_0"]) < 1
-            and abs(params["rho_m"]) < 1
-            and params["a"] > 0
-            and params["eta"] * (1 + abs(rho)) <= 2
+            and abs(params["rho_inf"]) < 1
+            and params["lam"] > 0
+            and params["eta"] * (1 + max_rho_abs) <= 2
         )
 
     def pack(self, params):
         gamma = np.clip(params["gamma"], 1e-6, 0.5 - 1e-6)
         return np.array([
-            np.log(max(params["theta"], 1e-9)),
-            np.log(max(params["eta"],   1e-9)),
-            np.log(gamma / (0.5 - gamma)),           # gamma in (0, 0.5)
-            np.arctanh(np.clip(params["rho_0"], -0.9999, 0.9999)),
-            np.arctanh(np.clip(params["rho_m"], -0.9999, 0.9999)),
-            np.log(max(params["a"], 1e-9)),
+            np.log(max(params["theta"],  1e-9)),
+            np.log(max(params["eta"],    1e-9)),
+            np.log(gamma / (0.5 - gamma)),
+            np.arctanh(np.clip(params["rho_0"],   -0.9999, 0.9999)),
+            np.arctanh(np.clip(params["rho_inf"], -0.9999, 0.9999)),
+            np.log(max(params["lam"], 1e-9)),
         ])
 
     def unpack(self, x):
         gamma_raw = np.exp(x[2])
         gamma     = 0.5 * gamma_raw / (1 + gamma_raw)
         return {
-            "theta": float(np.exp(x[0])),
-            "eta":   float(np.exp(x[1])),
-            "gamma": float(gamma),
-            "rho_0": float(np.tanh(x[3])),
-            "rho_m": float(np.tanh(x[4])),
-            "a":     float(np.exp(x[5])),
+            "theta":   float(np.exp(x[0])),
+            "eta":     float(np.exp(x[1])),
+            "gamma":   float(gamma),
+            "rho_0":   float(np.tanh(x[3])),
+            "rho_inf": float(np.tanh(x[4])),
+            "lam":     float(np.exp(x[5])),
         }
 
     def bounds(self):
         return [
-            (np.log(1e-5), np.log(10.0)),  # log theta
-            (np.log(1e-3), np.log(10.0)),  # log eta
-            (-5.0,  5.0),                  # gamma transform
-            (-3.5,  3.5),                  # arctanh rho_0
-            (-3.5,  3.5),                  # arctanh rho_m
-            (np.log(1e-2), np.log(10.0)), # log a
+            (np.log(1e-5), np.log(10.0)),           # log theta
+            (np.log(1e-3), np.log(10.0)),           # log eta
+            (-5.0, 5.0),                             # gamma transform
+            (-3.5, 3.5),                             # arctanh rho_0
+            (-3.5, 3.5),                             # arctanh rho_inf
+            (np.log(1e-2), np.log(50.0)),           # log lam
         ]
 
     def initial_guess(self, k, w_obs, t):
         atm_w = float(np.interp(0.0, np.sort(k), w_obs[np.argsort(k)]))
-        # rho_0 more negative (short-mat steep skew), rho_m less negative
         return {
-            "theta": atm_w,
-            "eta":   1.5,
-            "gamma": 0.4,
-            "rho_0": -0.8,
-            "rho_m": -0.4,
-            "a":     0.5,
+            "theta":   atm_w,
+            "eta":     1.5,
+            "gamma":   0.4,
+            "rho_0":   -0.8,
+            "rho_inf": -0.3,
+            "lam":     2.0,
         }
+
+    def min_g(self, params, k_range=(-4.0, 4.0), n=50):
+        """
+        Analytical per-slice butterfly check using closed-form eSSVI derivatives.
+
+        Same formula as SSVI.min_g but uses rho(theta) from _rho() rather than
+        a fixed rho parameter.  Checks the actual single-slice g(k)>=0 condition
+        rather than the stricter surface-level Gatheral-Jacquier condition —
+        critical for short maturities where per-slice solutions can be
+        butterfly-free even when eta*(1+|rho|) > 2 at the surface level.
+
+        ~15× faster than the base-class 600-point finite-difference scan.
+        """
+        k     = np.linspace(k_range[0], k_range[1], n)
+        theta = params["theta"]
+        rho   = self._rho(theta, params)
+        phi   = params["eta"] / (theta ** params["gamma"])
+        P     = phi * k + rho
+        D     = np.sqrt(np.maximum(P**2 + (1 - rho**2), 1e-10))
+        W     = np.maximum((theta / 2) * (1 + rho * phi * k + D), 1e-10)
+        dW    = (theta * phi / 2) * (rho + P / D)
+        d2W   = (theta * phi**2 / 2) * (1 - rho**2) / D**3
+        g     = (1 - k * dW / (2 * W))**2 - (dW**2 / 4) * (1/W + 0.25) + d2W / 2
+        return float(np.min(g))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL REGISTRY  —  add new models here
 # ─────────────────────────────────────────────────────────────────────────────

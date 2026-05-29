@@ -48,10 +48,10 @@ def _scatter_market(ax, df_slice, t):
         return
     if "bid_iv" in df_slice.columns and "ask_iv" in df_slice.columns:
         ax.scatter(df_slice["k"], df_slice["bid_iv"] * 100,
-                   color="#e05252", s=12, alpha=0.7, marker="v",
+                   color="#e05252", s=12, alpha=0.7, marker="x",
                    label="Bid", zorder=4)
         ax.scatter(df_slice["k"], df_slice["ask_iv"] * 100,
-                   color="#5288e0", s=12, alpha=0.7, marker="^",
+                   color="#5288e0", s=12, alpha=0.7, marker="x",
                    label="Ask", zorder=4)
     elif "mark_iv" in df_slice.columns:
         ax.scatter(df_slice["k"], df_slice['mark_iv'] * 100,
@@ -130,9 +130,9 @@ def plot_slices(result: dict, df=None, n_cols=3,
         figsize = (5.5 * n_cols, 4.2 * n_rows)
 
     fig    = plt.figure(figsize=figsize, facecolor="#111111")
-    colors = plt.cm.plasma(np.linspace(0.5, 1.25, n_slices))
+    colors = [0.994324, 0.716681, 0.177208, 1.      ]#plt.cm.plasma(np.linspace(0.5, 1.25, n_slices))
 
-    for idx, (t_exp, p, color) in enumerate(zip(expiries, params_list, colors)):
+    for idx, (t_exp, p) in enumerate(zip(expiries, params_list)):
         ax_iv  = fig.add_subplot(n_rows, n_cols, idx + 1)
         ax_rnd = ax_iv.twinx()
 
@@ -142,7 +142,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
 
         # Fitted smile
         iv_fit  = model.iv(k_grid, p, t_exp)
-        ax_iv.plot(k_grid, iv_fit * 100, color=color, lw=2.0,
+        ax_iv.plot(k_grid, iv_fit * 100, color=colors, lw=2.0,
                    label=f"{model.name} fit", zorder=3)
 
         # Market observations
@@ -151,7 +151,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
         # RND
         rnd       = model.butterfly_density(k_grid, p)
         has_neg   = model.has_butterfly_arb(p)
-        rnd_color = "#ff6b35" if has_neg else "#7ecf7e"
+        rnd_color = "#ff6b35" if has_neg else "#fbfffb"#"#7ecf7e"
         ax_rnd.fill_between(k_grid, rnd, alpha=0.22, color=rnd_color, zorder=1)
         ax_rnd.plot(k_grid, rnd, color=rnd_color, lw=1.0, alpha=0.7,
                     label="RND", zorder=2)
@@ -165,10 +165,10 @@ def plot_slices(result: dict, df=None, n_cols=3,
 
         ax_iv.set_title(title_str, color="white", fontsize=8.5, pad=5)
         ax_iv.set_xlabel("Log-strike  k", color="#aaaaaa", fontsize=7.5)
-        ax_iv.set_ylabel("Impl. Vol (%)", color=color, fontsize=7.5)
+        ax_iv.set_ylabel("Impl. Vol (%)", color=colors, fontsize=7.5)
         ax_rnd.set_ylabel("RND", color=rnd_color, fontsize=7.5)
         ax_iv.tick_params(colors="#aaaaaa", labelsize=7)
-        ax_iv.tick_params(axis="y", colors=color)
+        ax_iv.tick_params(axis="y", colors=colors)
         ax_rnd.tick_params(colors=rnd_color, labelsize=7)
         ax_iv.set_facecolor("#1a1a1a")
         for spine in list(ax_iv.spines.values()) + list(ax_rnd.spines.values()):

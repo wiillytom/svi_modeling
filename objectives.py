@@ -37,38 +37,37 @@ Metrics implemented
 
 import numpy as np
 from typing import Optional
+from scipy.stats import norm as _norm   # module-level: no per-call import overhead
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BLACK-SCHOLES HELPER  (inverse option / coin-margined)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _bs_call_price(k, mark_iv, t, is_inverse=True):
+def _bs_call_price(k, mark_iv, t):
     """
-    Black-Scholes call price normalised by the forward (F=1).
+    Vectorised Black-Scholes call price normalised by the forward (F=1).
 
-    For inverse options the price is in coin units, so the formula is
-    divided by F^2 relative to a regular option — but since we normalise
-    F=1 the formula is the same shape; the caller is responsible for
-    interpreting the units correctly.
+    k       : log-strike  log(K/F),  array-like
+    mark_iv : implied volatility,     array-like, same shape as k
+    t       : scalar time to expiry
 
-    k  : log-strike  log(K/F)
-    iv : implied volatility
-    t  : time to expiry
+    All numpy operations — no Python loop, no per-call import.
     """
-    mark_iv  = np.asarray(mark_iv, dtype=float)
-    k   = np.asarray(k,  dtype=float)
-    sqt = np.sqrt(np.maximum(t, 1e-10))
-    d1  = -k / (mark_iv * sqt) + mark_iv * sqt / 2
-    d2  = d1 - mark_iv * sqt
-    from scipy.stats import norm
-    price = norm.cdf(d1) - np.exp(k) * norm.cdf(d2)
+    mark_iv = np.asarray(mark_iv, dtype=float)
+    k       = np.asarray(k,       dtype=float)
+    mark_iv = np.maximum(mark_iv, 1e-8)           # guard against zero IV
+    sqt     = np.sqrt(max(t, 1e-10))
+    d1      = -k / (mark_iv * sqt) + mark_iv * sqt / 2
+    d2      = d1 - mark_iv * sqt
+    price   = _norm.cdf(d1) - np.exp(k) * _norm.cdf(d2)
     return np.maximum(price, 0.0)
 
 
 def _prices_from_iv(k, iv, t):
-    """Vectorised BS call prices for arrays of k and iv."""
-    return np.array([_bs_call_price(ki, s, t) for ki, s in zip(k, iv)])
+    """Vectorised BS call prices — passes full arrays to _bs_call_price."""
+    return _bs_call_price(np.asarray(k, dtype=float),
+                          np.asarray(iv, dtype=float), t)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,17 +132,17 @@ def _bs_vega(k, iv, t):
     -------
     vega : np.ndarray, same shape as k, strictly positive
     """
-    from scipy.stats import norm
+    
     k   = np.asarray(k,  dtype=float)
     iv  = np.asarray(iv, dtype=float)
     sqt = np.sqrt(np.maximum(t, 1e-10))
     iv  = np.maximum(iv, 1e-6)
     d1  = (-k / (iv * sqt)) + (iv * sqt / 2.0)
     # K = exp(k), so vega = sqrt(t) * exp(k) * phi(d1)
-    return sqt * np.exp(k) * norm.pdf(d1)
+    return sqt * np.exp(k) * _norm.pdf(d1)
 
 
-def obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
+def obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None, vegas=None):
     """
     Vega-weighted MSE on implied vol (Gatheral VW4, slide 'Choice of objective').
 
@@ -154,6 +153,13 @@ def obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
         weight_i = vega_i² / spread_i²
     so the fit is simultaneously ATM-biased and liquidity-aware. When spreads
     are absent, pure vega-weighting is used.
+
+    Parameters
+    ----------
+    vegas : array-like, optional
+        Precomputed Black-Scholes vegas (e.g. from df['vega']). When provided
+        these are used directly, skipping the internal _bs_vega() call. Pass
+        via calibrate_snapshot(..., vega_col='vega') or the global calibrators.
 
     Notes
     -----
@@ -166,7 +172,7 @@ def obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
     iv_fit = np.asarray(iv_fit, dtype=float)
     iv_obs = np.asarray(iv_obs, dtype=float)
 
-    vega    = _bs_vega(k, iv_obs, t)          # use observed IV for weights
+    vega    = np.asarray(vegas, dtype=float) if vegas is not None else _bs_vega(k, iv_obs, t)
     vega_sq = vega ** 2
 
     if spreads is not None and not np.all(spreads == 0):

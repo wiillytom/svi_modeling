@@ -28,8 +28,9 @@ Usage
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize, differential_evolution
+from scipy.optimize import minimize, differential_evolution, minimize_scalar
 import warnings
+import time as _time
 warnings.filterwarnings("ignore")
 
 from vol_models import VolModel, RawSVI, get_model
@@ -50,6 +51,62 @@ def crossedness(model: VolModel, p1: dict, p2: dict,
     k_grid = np.linspace(k_range[0], k_range[1], n)
     diff   = model.w(k_grid, p1) - model.w(k_grid, p2)
     return float(max(0.0, diff.max()))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARRAY BINDING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+import inspect as _inspect
+
+def _bind_extra(objective, vegas=None, bid=None, ask=None):
+    """
+    Bind precomputed per-slice arrays (vegas, bid, ask) to an objective in a
+    single pass.
+
+    Inspects the *original* objective's signature once, then builds one wrapper
+    that injects only the arrays the objective actually declares.
+
+    Why a single function matters
+    -----------------------------
+    Chaining _bind_vegas then _bind_bid_ask breaks silently: the wrapper
+    produced by the first call has a fixed signature that hides the inner
+    function's parameter names from the second call's inspector, so the second
+    binding is always a no-op.  Inspecting the original objective before any
+    wrapping avoids this entirely.
+    """
+    sig        = _inspect.signature(objective).parameters
+    want_vegas = vegas is not None and "vegas" in sig
+    want_ba    = (bid is not None and ask is not None
+                  and "bid" in sig and "ask" in sig)
+
+    if not want_vegas and not want_ba:
+        return objective          # nothing to bind — return original unchanged
+
+    _obj = objective
+    _v   = np.asarray(vegas, dtype=float) if want_vegas else None
+    _b   = np.asarray(bid,   dtype=float) if want_ba   else None
+    _a   = np.asarray(ask,   dtype=float) if want_ba   else None
+
+    def _bound(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
+        kw = {}
+        if _v is not None:
+            kw["vegas"] = _v
+        if _b is not None:
+            kw["bid"] = _b
+            kw["ask"] = _a
+        return _obj(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads, **kw)
+
+    _bound.__name__ = getattr(objective, "__name__", "objective")
+    return _bound
+
+
+# Thin wrappers kept for backwards compatibility.
+def _bind_vegas(objective, vegas):
+    return _bind_extra(objective, vegas=vegas)
+
+def _bind_bid_ask(objective, bid, ask):
+    return _bind_extra(objective, bid=bid, ask=ask)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,6 +293,9 @@ def calibrate_snapshot(
     min_points_per_slice: int      = 5,
     use_global_init:      bool     = True,
     spread_col:           str      = None,
+    vega_col:             str      = None,
+    bid_col:              str      = None,
+    ask_col:              str      = None,
     verbose:              bool     = True,
 ) -> dict:
     """
@@ -296,13 +356,17 @@ def calibrate_snapshot(
         iv_obs = subset["mark_iv"].values
     
         spreads = subset[spread_col].values if spread_col and spread_col in df.columns else None
+        vegas   = subset[vega_col].values   if vega_col  and vega_col  in df.columns else None
+        bid     = subset[bid_col].values    if bid_col   and bid_col   in df.columns else None
+        ask     = subset[ask_col].values    if ask_col   and ask_col   in df.columns else None
 
         prev_p = fitted_params[i-1] if i > 0 and fitted_params[i-1] is not None else None
 
+        slice_obj = _bind_extra(objective, vegas=vegas, bid=bid, ask=ask)
         params = fit_single_slice(
             k_obs, w_obs, iv_obs, t_exp,
             model=model,
-            objective=objective,
+            objective=slice_obj,
             spreads=spreads,
             prev_params=prev_p,
             next_params=None,
@@ -348,16 +412,52 @@ def calibrate_snapshot(
 
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PARALLEL WARM-START WORKER  (module-level so joblib/loky can pickle it)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fit_ssvi_warm_start_slice(sl, ssvi_model, objective, use_de=True):
+    """
+    Fit a single per-slice SSVI for warm-starting global eSSVI/SSVI.
+    Module-level so the loky backend can pickle it without cloudpickle.
+
+    use_de=True  → differential_evolution + NM polish  (~1–2 s per slice)
+    use_de=False → NM only from initial guess          (~0.1 s per slice)
+                   Sufficient when many slices are available and a rough
+                   warm-start is fine.
+    """
+    try:
+        p = fit_single_slice(
+            sl["k"], sl["w"], sl["iv"], sl["t"],
+            model=ssvi_model,
+            objective=objective,
+            use_global_init=use_de,
+        )
+        return float(p["theta"]), float(p["eta"]), float(p["gamma"]), float(p["rho"])
+    except Exception:
+        theta = float(np.interp(0.0,
+                                np.sort(sl["k"]),
+                                sl["w"][np.argsort(sl["k"])]))
+        return theta, 1.5, 0.4, -0.7
+
+
 def calibrate_global_essvi(
-    df:           pd.DataFrame,
-    model,                        # eSSVI instance
-    objective     = None,
-    penalty_cal:  float = 500.0,
-    penalty_but:  float = 200.0,
-    verbose:      bool  = True,
+    df:                pd.DataFrame,
+    model,                             # eSSVI instance
+    objective          = None,
+    penalty_cal:       float = 500.0,
+    penalty_but:       float = 200.0,
+    smoothness_weight: float = 0.0,
+    vega_col:          str   = None,
+    bid_col:           str   = None,
+    ask_col:           str   = None,
+    n_jobs:            int   = 1,
+    speed_mode:        str   = "auto",
+    verbose:           bool  = True,
 ) -> dict:
     """
-    Global calibration for eSSVI.
+    Global calibration for eSSVI, optionally with time-smoothness on the smile
+    shape parameters.
 
     Only the rho(theta) shape parameters are shared across all slices:
         rho_0   : short-maturity correlation limit   (global)
@@ -370,6 +470,39 @@ def calibrate_global_essvi(
         gamma_i : skew decay exponent  (per-slice)
 
     Total params: 3 + 3*n
+
+    Time-smoothness (smoothness_weight > 0)
+    ---------------------------------------
+    eSSVI gives rho a smooth time dependence through rho(theta(t)), but
+    eta_i and gamma_i are free per-slice — which can produce visibly
+    jagged surfaces where the smile shape changes wildly between adjacent
+    expiries.  Setting smoothness_weight > 0 adds a fractional-change
+    penalty on (eta_i, gamma_i):
+
+        pen = smoothness_weight * Σ_{i≥1} [
+                (Δη_i / η_{i-1})² + (Δγ_i / γ_{i-1})²
+              ] / Δt_i
+
+    where Δt_i = t_i − t_{i-1}.  The denominator turns the penalty into a
+    "rate of change" — adjacent expiries are smoothed more strongly than
+    distant ones for the same absolute parameter change.  Fractional
+    differences keep the scale comparable across η (typically 1–3) and
+    γ (typically 0.1–0.5).
+
+    Choosing smoothness_weight
+        0.0   → pure eSSVI (default, unchanged behaviour)
+        0.01  → light smoothing for stability without distorting tight fits
+        0.05  → moderate smoothing, useful for sparse / noisy snapshots
+        0.5   → strong smoothing, smile shape forced near-constant in t
+
+    speed_mode
+    ----------
+        "auto"     → thorough if n_slices ≤ 25, fast otherwise  (default)
+        "thorough" → SSVI warm-start + NM + DE + NM polish
+                     Best for n ≤ 25.  DE in >100-d is impractical.
+        "fast"     → SSVI warm-start + L-BFGS-B polish  (skips DE)
+                     Required for large surfaces (n > 25, e.g. multi-day
+                     aggregations or every-tick recalibration).
 
     Speed design
     ------------
@@ -393,11 +526,22 @@ def calibrate_global_essvi(
     for t in expiries:
         sub = df[df["t"] == t]
         slices.append({
-            "t":  t,
-            "k":  sub["k"].values,
-            "w":  sub["w"].values,
-            "iv": sub["mark_iv"].values,
+            "t":    t,
+            "k":    sub["k"].values,
+            "w":    sub["w"].values,
+            "iv":   sub["mark_iv"].values,
+            "vegas": sub[vega_col].values if vega_col and vega_col in df.columns else None,
+            "bid":   sub[bid_col].values  if bid_col  and bid_col  in df.columns else None,
+            "ask":   sub[ask_col].values  if ask_col  and ask_col  in df.columns else None,
         })
+
+    # Pre-bind per-slice objectives with precomputed vegas and bid/ask arrays.
+    # Single-pass binding: inspects the original objective once to avoid
+    # the chaining bug where wrapped signatures hide inner parameters.
+    slice_objectives = [
+        _bind_extra(objective, vegas=sl["vegas"], bid=sl["bid"], ask=sl["ask"])
+        for sl in slices
+    ]
 
     # ── Warm-start: per-slice SSVI fits (with DE for robustness) ─────────────
     # use_global_init=True so short maturities with extreme IV (200-400%)
@@ -408,22 +552,61 @@ def calibrate_global_essvi(
     init_gammas = np.full(n, 0.4)
     init_rhos   = np.full(n, -0.7)   # collected for rho-curve fitting below
 
-    for i, sl in enumerate(slices):
+    # ── Speed mode decision ───────────────────────────────────────────────────
+    # In "fast" mode (auto-triggered when n>25) the per-slice warm-start uses
+    # NM only (no DE), the global DE phase is skipped entirely, and the polish
+    # uses L-BFGS-B instead of Nelder-Mead.  This is the only way to stay
+    # under a minute when n is large because DE in 3+3n ≥ 100 dimensions is
+    # impractical (~5·dim·maxiter evaluations × n slice walks per evaluation).
+    _use_fast = (speed_mode == "fast") or (speed_mode == "auto" and n > 25)
+    _warm_de  = not _use_fast or n <= 50    # DE per-slice unless very wide
+
+    if verbose:
+        _mode_str = "fast (skip DE, L-BFGS-B polish)" if _use_fast \
+                     else "thorough (NM + DE + NM)"
+        print(f"  speed_mode    : {speed_mode} → {_mode_str}")
+
+    # ── Parallel warm-start when n_jobs != 1 ─────────────────────────────────
+    _have_joblib = False
+    if n_jobs != 1:
         try:
-            p_ssvi = fit_single_slice(
-                sl["k"], sl["w"], sl["iv"], sl["t"],
-                model=ssvi_model,
-                objective=objective,
-                use_global_init=True,   # DE to handle high-IV short maturities
+            from joblib import Parallel as _Parallel, delayed as _delayed
+            _have_joblib = True
+        except ImportError:
+            if verbose:
+                print("  joblib not found — falling back to sequential warm-start")
+
+    _t_ws = _time.time()
+    if n_jobs != 1 and _have_joblib:
+        if verbose:
+            _algo = "DE+NM" if _warm_de else "NM only"
+            print(f"  SSVI warm-start ({_algo}, n_jobs={n_jobs}, {n} slices) ...")
+        _ws_results = _Parallel(
+            n_jobs=n_jobs,
+            verbose=10 if verbose else 0,    # joblib prints progress every ~10 tasks
+        )(
+            _delayed(_fit_ssvi_warm_start_slice)(sl, ssvi_model, objective, _warm_de)
+            for sl in slices
+        )
+        for i, (theta, eta, gamma, rho) in enumerate(_ws_results):
+            init_thetas[i] = theta
+            init_etas[i]   = eta
+            init_gammas[i] = gamma
+            init_rhos[i]   = rho
+    else:
+        if verbose:
+            _algo = "DE+NM" if _warm_de else "NM only"
+            print(f"  SSVI warm-start ({_algo}, sequential, {n} slices) ...")
+        for i, sl in enumerate(slices):
+            theta, eta, gamma, rho = _fit_ssvi_warm_start_slice(
+                sl, ssvi_model, objective, _warm_de
             )
-            init_thetas[i] = p_ssvi["theta"]
-            init_etas[i]   = p_ssvi["eta"]
-            init_gammas[i] = p_ssvi["gamma"]
-            init_rhos[i]   = p_ssvi["rho"]
-        except Exception:
-            init_thetas[i] = float(np.interp(
-                0.0, np.sort(sl["k"]), sl["w"][np.argsort(sl["k"])]
-            ))
+            init_thetas[i] = theta
+            init_etas[i]   = eta
+            init_gammas[i] = gamma
+            init_rhos[i]   = rho
+    if verbose:
+        print(f"  SSVI warm-start done in {_time.time()-_t_ws:.1f}s")
 
     init_thetas = np.maximum.accumulate(init_thetas)
 
@@ -471,6 +654,10 @@ def calibrate_global_essvi(
         thetas  = np.exp(x[3 + 2*n :])
         return rho_0, rho_inf, lam, etas, gammas, thetas
 
+    # ── Precompute Δt for smoothness penalty ──────────────────────────────────
+    ts_arr   = np.array([sl["t"] for sl in slices], dtype=float)
+    dts_safe = np.maximum(np.diff(ts_arr), 1e-3) if n > 1 else np.array([])
+
     # ── Objective ─────────────────────────────────────────────────────────────
     # Calendar arbitrage strategy: for SSVI-type smiles, w(k=0) = theta exactly,
     # so theta monotonicity catches ATM calendar arb with zero overhead.
@@ -492,8 +679,8 @@ def calibrate_global_essvi(
             w_fit  = model.w(sl["k"], params)
             iv_fit = model.iv(sl["k"], params, sl["t"])
 
-            total += objective(w_fit, sl["w"], iv_fit, sl["iv"],
-                               sl["k"], sl["t"], None)
+            total += slice_objectives[i](w_fit, sl["w"], iv_fit, sl["iv"],
+                                        sl["k"], sl["t"], None)
 
             # Butterfly: fast analytical check via eSSVI.min_g override
             mg = model.min_g(params)
@@ -502,6 +689,18 @@ def calibrate_global_essvi(
             # Calendar: theta non-decreasing is the ATM condition (w(0)=theta)
             if i > 0:
                 total += max(0.0, thetas[i-1] - thetas[i]) * penalty_cal * 10
+
+        # ── Time-smoothness on (eta, gamma) ───────────────────────────────────
+        # Fractional differences make the penalty scale-invariant between
+        # eta (~1–3) and gamma (~0.1–0.5).  Division by Δt expresses the
+        # penalty as a per-year rate of change, so adjacent expiries are
+        # smoothed more than distant ones.
+        if smoothness_weight > 0.0 and n > 1:
+            eta_rel = np.diff(etas)   / np.maximum(etas[:-1],   1e-2)
+            gam_rel = np.diff(gammas) / np.maximum(gammas[:-1], 5e-3)
+            total  += smoothness_weight * float(
+                np.sum((eta_rel ** 2 + gam_rel ** 2) / dts_safe)
+            )
 
         return total
 
@@ -526,29 +725,59 @@ def calibrate_global_essvi(
         print(f"Slices    : {n}  |  Params: {len(x0)} total  "
               f"(3 global + 3×{n} per-slice)")
         print(f"  rho warm-start: rho_0={init_rho_0:.3f}  "
-              f"rho_inf={init_rho_inf:.3f}  lam={init_lam:.3f}\n")
+              f"rho_inf={init_rho_inf:.3f}  lam={init_lam:.3f}")
+        if smoothness_weight > 0.0:
+            print(f"  time-smoothness on (eta, gamma): "
+                  f"smoothness_weight={smoothness_weight}\n")
+        else:
+            print(f"  time-smoothness: off (smoothness_weight=0)\n")
 
-    # ── Phase 1: quick local NM from the data-informed warm-start ─────────────
-    res_warm = minimize(
-        objective_fn, x0, method="Nelder-Mead",
-        options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-6},
-    )
-
-    # ── Phase 2: global DE (affordable because min_g is now analytical) ───────
-    # popsize=5 (minimum), maxiter=150 → ~5·dim·150 evaluations
-    de_res = differential_evolution(
-        objective_fn, bounds,
-        seed=42, maxiter=150, tol=1e-5,
-        popsize=5, mutation=(0.5, 1.5), recombination=0.9,
-        workers=1,
-    )
-
-    # ── Phase 3: final polish from best candidate ─────────────────────────────
-    x_best = res_warm.x if res_warm.fun <= de_res.fun else de_res.x
-    res = minimize(
-        objective_fn, x_best, method="Nelder-Mead",
-        options={"maxiter": 5000, "xatol": 1e-9, "fatol": 1e-9},
-    )
+    # ── Optimisation phases ───────────────────────────────────────────────────
+    if _use_fast:
+        # FAST: skip DE, polish with L-BFGS-B (O(dim) per step instead of O(dim²))
+        if verbose:
+            print(f"  Phase: L-BFGS-B polish from warm-start ({len(x0)} params) ...")
+            _tp = _time.time()
+        res = minimize(
+            objective_fn, x0, method="L-BFGS-B", bounds=bounds,
+            options={"maxiter": 500, "ftol": 1e-9, "gtol": 1e-7},
+        )
+        if verbose:
+            print(f"    L-BFGS-B: {_time.time()-_tp:.1f}s  "
+                  f"loss={res.fun:.4e}  nit={res.nit}")
+    else:
+        # THOROUGH: NM warm-start → DE → NM polish (3+3n bounded grid)
+        if verbose:
+            print(f"  Phase 1 NM warm-start ({len(x0)} params) ...")
+            _tp = _time.time()
+        res_warm = minimize(
+            objective_fn, x0, method="Nelder-Mead",
+            options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-6},
+        )
+        if verbose:
+            print(f"    Phase 1 NM:  {_time.time()-_tp:.1f}s  "
+                  f"loss={res_warm.fun:.4e}")
+            print(f"  Phase 2 DE (popsize=5, maxiter=150) ...")
+            _tp = _time.time()
+        de_res = differential_evolution(
+            objective_fn, bounds,
+            seed=42, maxiter=150, tol=1e-5,
+            popsize=5, mutation=(0.5, 1.5), recombination=0.9,
+            workers=1,
+        )
+        if verbose:
+            print(f"    Phase 2 DE:  {_time.time()-_tp:.1f}s  "
+                  f"loss={de_res.fun:.4e}")
+            print(f"  Phase 3 NM polish from best candidate ...")
+            _tp = _time.time()
+        x_best = res_warm.x if res_warm.fun <= de_res.fun else de_res.x
+        res = minimize(
+            objective_fn, x_best, method="Nelder-Mead",
+            options={"maxiter": 5000, "xatol": 1e-9, "fatol": 1e-9},
+        )
+        if verbose:
+            print(f"    Phase 3 NM:  {_time.time()-_tp:.1f}s  "
+                  f"loss={res.fun:.4e}")
 
     rho_0, rho_inf, lam, etas, gammas, thetas = unpack_global(res.x)
 
@@ -593,6 +822,534 @@ def calibrate_global_essvi(
         "n_points":   [len(df[df["t"] == sl["t"]]) for sl in slices],
         "_model":     model,
     }
+
+def calibrate_global_ssvi(
+    df:           pd.DataFrame,
+    model         = None,
+    objective     = None,
+    penalty_cal:  float = 500.0,
+    penalty_but:  float = 200.0,
+    vega_col:     str   = None,
+    bid_col:      str   = None,
+    ask_col:      str   = None,
+    verbose:      bool  = True,
+) -> dict:
+    """
+    Global calibration for SSVI — shared (eta, gamma, rho) across all maturities,
+    only theta fitted per slice.
+
+    This is the Gatheral-Jacquier (2014) surface SSVI:
+
+        phi(theta)  = eta / theta^gamma          (global eta, gamma)
+        rho         = constant                   (global rho)
+        theta_i     = ATM total variance          (per-slice)
+
+    Total params: 3 + n
+
+    Under eta*(1+|rho|) <= 2, gamma in (0, 0.5], and theta non-decreasing,
+    the surface is provably free of static arbitrage (GJ 2014 Theorem 4.4).
+    No crossedness check is needed in the hot loop — theta monotonicity is
+    sufficient for the global surface.
+
+    This is the baseline that eSSVI generalises: every global SSVI solution
+    is a special case of eSSVI with rho_0 = rho_inf = rho (any lam).
+
+    Speed design
+    ------------
+    - 3 + n params vs 4n for per-slice SSVI → much smaller search space.
+    - Warm-start pools per-slice SSVI fits and takes the median eta/gamma/rho.
+    - DE budget can be larger than eSSVI (13 params vs 33 for n=10).
+    """
+    from vol_models import get_model as _get_model
+
+    if model is None:
+        model = _get_model("ssvi")
+    if objective is None:
+        objective = get_objective("iv_wmse")
+    elif isinstance(objective, str):
+        objective = get_objective(objective)
+
+    expiries = sorted(df["t"].unique())
+    n        = len(expiries)
+
+    # ── Build per-slice data ──────────────────────────────────────────────────
+    slices = []
+    for t in expiries:
+        sub = df[df["t"] == t]
+        slices.append({
+            "t":    t,
+            "k":    sub["k"].values,
+            "w":    sub["w"].values,
+            "iv":   sub["mark_iv"].values,
+            "vegas": sub[vega_col].values if vega_col and vega_col in df.columns else None,
+            "bid":   sub[bid_col].values  if bid_col  and bid_col  in df.columns else None,
+            "ask":   sub[ask_col].values  if ask_col  and ask_col  in df.columns else None,
+        })
+
+    # Pre-bind per-slice objectives with precomputed vegas and bid/ask arrays.
+    slice_objectives = [
+        _bind_extra(objective, vegas=sl["vegas"], bid=sl["bid"], ask=sl["ask"])
+        for sl in slices
+    ]
+
+    # ── Warm-start: pool per-slice SSVI fits ──────────────────────────────────
+    ssvi_model  = model
+    init_thetas = np.empty(n)
+    init_etas   = np.full(n, 1.5)
+    init_gammas = np.full(n, 0.4)
+    init_rhos   = np.full(n, -0.7)
+
+    for i, sl in enumerate(slices):
+        try:
+            p = fit_single_slice(
+                sl["k"], sl["w"], sl["iv"], sl["t"],
+                model=ssvi_model,
+                objective=objective,
+                use_global_init=True,
+            )
+            init_thetas[i] = p["theta"]
+            init_etas[i]   = p["eta"]
+            init_gammas[i] = p["gamma"]
+            init_rhos[i]   = p["rho"]
+        except Exception:
+            init_thetas[i] = float(np.interp(
+                0.0, np.sort(sl["k"]), sl["w"][np.argsort(sl["k"])]
+            ))
+
+    init_thetas = np.maximum.accumulate(init_thetas)
+    # Median is more robust than mean against outlier slices
+    init_eta   = float(np.median(init_etas))
+    init_gamma = float(np.median(init_gammas))
+    init_rho   = float(np.median(init_rhos))
+
+    # ── Parametrisation ───────────────────────────────────────────────────────
+    # Layout: [arctanh(rho), log(eta), logit_gamma, log(theta_0), ..., log(theta_n-1)]
+
+    def pack_global(rho, eta, gamma, thetas):
+        gamma_c = np.clip(gamma, 1e-6, 0.5 - 1e-6)
+        return np.concatenate([
+            [np.arctanh(np.clip(rho, -0.9999, 0.9999))],
+            [np.log(max(eta, 1e-9))],
+            [np.log(gamma_c / (0.5 - gamma_c))],
+            np.log(np.maximum(thetas, 1e-9)),
+        ])
+
+    def unpack_global(x):
+        rho    = float(np.tanh(x[0]))
+        eta    = float(np.exp(x[1]))
+        gr     = np.exp(x[2])
+        gamma  = float(0.5 * gr / (1 + gr))
+        thetas = np.exp(x[3:])
+        return rho, eta, gamma, thetas
+
+    # ── Objective ─────────────────────────────────────────────────────────────
+    # For global SSVI, theta monotonicity alone is sufficient to guarantee
+    # surface-wide calendar-spread freedom (GJ 2014).  No crossedness call needed.
+    def objective_fn(x):
+        rho, eta, gamma, thetas = unpack_global(x)
+        total = 0.0
+
+        for i, sl in enumerate(slices):
+            params = {
+                "theta": float(thetas[i]),
+                "eta":   eta,
+                "gamma": gamma,
+                "rho":   rho,
+            }
+            w_fit  = model.w(sl["k"], params)
+            iv_fit = model.iv(sl["k"], params, sl["t"])
+
+            total += slice_objectives[i](w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"], None)
+
+            # Butterfly: analytical per-slice check
+            mg = model.min_g(params)
+            total += max(0.0, -mg) * penalty_but
+
+            # Calendar: theta non-decreasing (necessary and sufficient for global SSVI)
+            if i > 0:
+                total += max(0.0, thetas[i-1] - thetas[i]) * penalty_cal * 10
+
+        return total
+
+    # ── Pack warm-start ───────────────────────────────────────────────────────
+    x0 = pack_global(init_rho, init_eta, init_gamma, init_thetas)
+
+    bounds = (
+        [(-3.5, 3.5)]                           # arctanh rho
+        + [(np.log(1e-3), np.log(10.0))]        # log eta
+        + [(-5.0, 5.0)]                          # gamma transform
+        + [(np.log(1e-5), np.log(10.0))] * n    # log theta per slice
+    )
+
+    if verbose:
+        print(f"\nModel     : SSVI (global eta/gamma/rho, per-slice theta)")
+        print(f"Objective : {objective.__name__}")
+        print(f"Slices    : {n}  |  Params: {len(x0)} total  "
+              f"(3 global + {n} per-slice theta)")
+        print(f"  warm-start: eta={init_eta:.3f}  gamma={init_gamma:.3f}  "
+              f"rho={init_rho:.3f}\n")
+
+    # ── Phase 1: quick local NM from the data-informed warm-start ─────────────
+    res_warm = minimize(
+        objective_fn, x0, method="Nelder-Mead",
+        options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-6},
+    )
+
+    # ── Phase 2: global DE (larger budget than eSSVI — only 3+n params) ───────
+    de_res = differential_evolution(
+        objective_fn, bounds,
+        seed=42, maxiter=300, tol=1e-6,
+        popsize=8, mutation=(0.5, 1.5), recombination=0.9,
+        workers=1,
+    )
+
+    # ── Phase 3: final polish from best candidate ─────────────────────────────
+    x_best = res_warm.x if res_warm.fun <= de_res.fun else de_res.x
+    res = minimize(
+        objective_fn, x_best, method="Nelder-Mead",
+        options={"maxiter": 5000, "xatol": 1e-9, "fatol": 1e-9},
+    )
+
+    rho, eta, gamma, thetas = unpack_global(res.x)
+
+    if verbose:
+        print(f"  eta={eta:.4f}  gamma={gamma:.4f}  rho={rho:.4f}\n")
+
+    # ── Build result dict ─────────────────────────────────────────────────────
+    params_out  = []
+    metrics_out = {m: [] for m in DEFAULT_METRICS}
+
+    for i, sl in enumerate(slices):
+        p = {
+            "theta": float(thetas[i]),
+            "eta":   eta,
+            "gamma": gamma,
+            "rho":   rho,
+        }
+        params_out.append(p)
+
+        w_fit  = model.w(sl["k"], p)
+        iv_fit = model.iv(sl["k"], p, sl["t"])
+        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"])
+        for m in DEFAULT_METRICS:
+            metrics_out[m].append(evals[m])
+
+        if verbose:
+            cal_ok = "ok" if i == 0 else (
+                "⚠ cal" if crossedness(model, params_out[i-1], p) > 1e-6 else "ok"
+            )
+            arb_ok = "ok" if model.min_g(p) >= 0 else "⚠ butterfly"
+            print(f"  T={sl['t']:.4f}  theta={thetas[i]:.5f}  "
+                  f"iv_rmse={evals['iv_rmse']:.4f}  [{arb_ok}]  [{cal_ok}]")
+
+    return {
+        "model_name": "SSVI (global)",
+        "objective":  objective.__name__,
+        "expiries":   [sl["t"] for sl in slices],
+        "params":     params_out,
+        "metrics":    metrics_out,
+        "n_points":   [len(df[df["t"] == sl["t"]]) for sl in slices],
+        "_model":     model,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FAST UPDATE FOR MARKET MAKING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calibrate_global_essvi_update(
+    df:           pd.DataFrame,
+    prev_result:  dict,
+    model         = None,
+    objective     = None,
+    mode:         str   = "full_polish",
+    vega_col:     str   = None,
+    bid_col:      str   = None,
+    ask_col:      str   = None,
+    penalty_cal:  float = 500.0,
+    penalty_but:  float = 200.0,
+    verbose:      bool  = False,
+) -> dict:
+    """
+    Fast recalibration of eSSVI from a previous result.
+
+    Designed for tick-by-tick market-making updates where the previous fit is a
+    good warm start and a full DE pass would be too slow.
+
+    Two modes
+    ---------
+    "theta_only"  (~50–200 ms)
+        Holds every shape parameter (rho_0, rho_inf, lam, eta_i, gamma_i)
+        fixed at their previous values and refits only the n ATM variance
+        levels θᵢ using independent 1-D Brent searches.  Use when smile
+        shape is stable and only the ATM level has moved.
+
+    "full_polish"  (~1–3 s)
+        Packs the previous result as the starting point for a short
+        Nelder-Mead run (maxiter=500).  Skips the SSVI warm-start loop and
+        the DE phase entirely.  Use after a modest market move where shape
+        may have shifted slightly.
+
+    Parameters
+    ----------
+    df           : current snapshot (same format as calibrate_global_essvi)
+    prev_result  : dict from calibrate_global_essvi or a prior update call
+    model        : eSSVI instance  (default: taken from prev_result["_model"])
+    objective    : callable or str  (default: iv_wmse)
+    mode         : "theta_only" | "full_polish"
+    vega_col     : column for precomputed vegas  (optional)
+    bid_col      : column for bid IV  (optional)
+    ask_col      : column for ask IV  (optional)
+    penalty_cal  : calendar-spread penalty weight
+    penalty_but  : butterfly-arbitrage penalty weight
+    verbose      : print timing and per-slice metrics
+
+    Returns
+    -------
+    Same result-dict format as calibrate_global_essvi.
+    """
+    t0 = _time.time()
+
+    # ── Defaults ──────────────────────────────────────────────────────────────
+    if model is None:
+        model = prev_result.get("_model")
+        if model is None:
+            raise ValueError(
+                "model not found in prev_result; pass the model explicitly."
+            )
+    if objective is None:
+        objective = get_objective("iv_wmse")
+    elif isinstance(objective, str):
+        objective = get_objective(objective)
+
+    expiries = sorted(df["t"].unique())
+    n        = len(expiries)
+
+    # ── Build per-slice data ──────────────────────────────────────────────────
+    slices = []
+    for t in expiries:
+        sub = df[df["t"] == t]
+        slices.append({
+            "t":    t,
+            "k":    sub["k"].values,
+            "w":    sub["w"].values,
+            "iv":   sub["mark_iv"].values,
+            "vegas": sub[vega_col].values if vega_col and vega_col in df.columns else None,
+            "bid":   sub[bid_col].values  if bid_col  and bid_col  in df.columns else None,
+            "ask":   sub[ask_col].values  if ask_col  and ask_col  in df.columns else None,
+        })
+
+    slice_objectives = [
+        _bind_extra(objective, vegas=sl["vegas"], bid=sl["bid"], ask=sl["ask"])
+        for sl in slices
+    ]
+
+    # ── Nearest-T matching: map each current expiry to prev params ────────────
+    old_T      = np.asarray(prev_result["expiries"])
+    old_params = prev_result["params"]
+
+    def _nearest_prev(t_query):
+        return old_params[int(np.argmin(np.abs(old_T - t_query)))]
+
+    # ── Extract global rho-curve params ───────────────────────────────────────
+    p_ref   = old_params[0]
+    rho_0   = float(p_ref.get("rho_0",   p_ref.get("rho", -0.7)))
+    rho_inf = float(p_ref.get("rho_inf", rho_0))
+    lam     = float(p_ref.get("lam", 2.0))
+
+    # =========================================================================
+    # MODE: theta_only
+    # =========================================================================
+    if mode == "theta_only":
+        if verbose:
+            print(f"\n  [theta_only] Refitting {n} θᵢ  "
+                  f"(all shape params fixed from previous fit)")
+
+        prev_theta = None
+        thetas_out = np.empty(n)
+
+        for i, sl in enumerate(slices):
+            pp = _nearest_prev(sl["t"])
+            shape = {
+                "rho_0":   rho_0,
+                "rho_inf": rho_inf,
+                "lam":     lam,
+                "eta":     float(pp.get("eta",   1.5)),
+                "gamma":   float(pp.get("gamma", 0.4)),
+            }
+            # Lower bound enforces calendar monotonicity
+            theta_lb = max(prev_theta if prev_theta is not None else 1e-5, 1e-5)
+            theta_ub = 10.0
+
+            # Capture loop variables via default args (avoids late-binding bugs)
+            def _loss_1d(log_theta,
+                         _shape=shape, _sl=sl, _so=slice_objectives[i],
+                         _prev=prev_theta):
+                theta  = np.exp(log_theta)
+                params = {**_shape, "theta": theta}
+                w_fit  = model.w(_sl["k"], params)
+                iv_fit = model.iv(_sl["k"], params, _sl["t"])
+                err    = _so(w_fit, _sl["w"], iv_fit, _sl["iv"],
+                             _sl["k"], _sl["t"], None)
+                mg     = model.min_g(params)
+                err   += max(0.0, -mg) * penalty_but
+                if _prev is not None:
+                    err += max(0.0, _prev - theta) * penalty_cal * 10
+                return err
+
+            res_1d = minimize_scalar(
+                _loss_1d,
+                bounds=(np.log(theta_lb), np.log(theta_ub)),
+                method="bounded",
+                options={"xatol": 1e-7},
+            )
+            theta_i = max(float(np.exp(res_1d.x)),
+                          prev_theta if prev_theta is not None else 1e-5)
+            thetas_out[i] = theta_i
+            prev_theta    = theta_i
+
+        # ── Build result ──────────────────────────────────────────────────────
+        params_out  = []
+        metrics_out = {m: [] for m in DEFAULT_METRICS}
+
+        for i, sl in enumerate(slices):
+            pp = _nearest_prev(sl["t"])
+            p  = {
+                "theta":   float(thetas_out[i]),
+                "eta":     float(pp.get("eta",   1.5)),
+                "gamma":   float(pp.get("gamma", 0.4)),
+                "rho_0":   rho_0,
+                "rho_inf": rho_inf,
+                "lam":     lam,
+            }
+            params_out.append(p)
+            w_fit  = model.w(sl["k"], p)
+            iv_fit = model.iv(sl["k"], p, sl["t"])
+            evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"])
+            for m in DEFAULT_METRICS:
+                metrics_out[m].append(evals[m])
+            if verbose:
+                print(f"    T={sl['t']:.4f}  θ={thetas_out[i]:.5f}  "
+                      f"iv_rmse={evals['iv_rmse']:.4f}")
+
+        elapsed = _time.time() - t0
+        if verbose:
+            print(f"  [theta_only] done in {elapsed*1000:.1f} ms")
+
+        return {
+            "model_name": model.name + " (theta_only update)",
+            "objective":  objective.__name__,
+            "expiries":   [sl["t"] for sl in slices],
+            "params":     params_out,
+            "metrics":    metrics_out,
+            "n_points":   [len(df[df["t"] == sl["t"]]) for sl in slices],
+            "_model":     model,
+        }
+
+    # =========================================================================
+    # MODE: full_polish
+    # =========================================================================
+    # Pack/unpack helpers (same parametrisation as calibrate_global_essvi)
+    def _pack(rho_0, rho_inf, lam, etas, gammas, thetas):
+        gc = np.clip(gammas, 1e-6, 0.5 - 1e-6)
+        return np.concatenate([
+            [np.arctanh(np.clip(rho_0,  -0.9999, 0.9999))],
+            [np.arctanh(np.clip(rho_inf,-0.9999, 0.9999))],
+            [np.log(max(lam, 1e-9))],
+            np.log(np.maximum(etas, 1e-9)),
+            np.log(gc / (0.5 - gc)),
+            np.log(np.maximum(thetas, 1e-9)),
+        ])
+
+    def _unpack(x):
+        r0   = float(np.tanh(x[0]))
+        ri   = float(np.tanh(x[1]))
+        la   = float(np.exp(x[2]))
+        etas = np.exp(x[3 : 3 + n])
+        gr   = np.exp(x[3 + n : 3 + 2*n])
+        gams = 0.5 * gr / (1.0 + gr)
+        ths  = np.exp(x[3 + 2*n :])
+        return r0, ri, la, etas, gams, ths
+
+    # Warm-start from nearest previous params per slice
+    pm = [_nearest_prev(sl["t"]) for sl in slices]
+    etas0   = np.array([float(p.get("eta",   1.5))  for p in pm])
+    gammas0 = np.array([float(p.get("gamma", 0.4))  for p in pm])
+    thetas0 = np.maximum.accumulate(
+        np.maximum([float(p.get("theta", 0.05)) for p in pm], 1e-5)
+    )
+    x0 = _pack(rho_0, rho_inf, lam, etas0, gammas0, thetas0)
+
+    def _objective_fn(x):
+        r0, ri, la, etas, gams, ths = _unpack(x)
+        total = 0.0
+        for i, sl in enumerate(slices):
+            params = {
+                "theta":   float(ths[i]),
+                "eta":     float(etas[i]),
+                "gamma":   float(gams[i]),
+                "rho_0":   r0,
+                "rho_inf": ri,
+                "lam":     la,
+            }
+            w_fit  = model.w(sl["k"], params)
+            iv_fit = model.iv(sl["k"], params, sl["t"])
+            total += slice_objectives[i](w_fit, sl["w"], iv_fit, sl["iv"],
+                                         sl["k"], sl["t"], None)
+            total += max(0.0, -model.min_g(params)) * penalty_but
+            if i > 0:
+                total += max(0.0, ths[i-1] - ths[i]) * penalty_cal * 10
+        return total
+
+    if verbose:
+        print(f"\n  [full_polish] NM polish from previous result  "
+              f"({len(x0)} params,  maxiter=500)")
+
+    res = minimize(
+        _objective_fn, x0, method="Nelder-Mead",
+        options={"maxiter": 500, "xatol": 1e-7, "fatol": 1e-7},
+    )
+
+    r0, ri, la, etas, gams, ths = _unpack(res.x)
+
+    # ── Build result ──────────────────────────────────────────────────────────
+    params_out  = []
+    metrics_out = {m: [] for m in DEFAULT_METRICS}
+
+    for i, sl in enumerate(slices):
+        p = {
+            "theta":   float(ths[i]),
+            "eta":     float(etas[i]),
+            "gamma":   float(gams[i]),
+            "rho_0":   r0,
+            "rho_inf": ri,
+            "lam":     la,
+        }
+        params_out.append(p)
+        w_fit  = model.w(sl["k"], p)
+        iv_fit = model.iv(sl["k"], p, sl["t"])
+        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"])
+        for m in DEFAULT_METRICS:
+            metrics_out[m].append(evals[m])
+        if verbose:
+            print(f"    T={sl['t']:.4f}  θ={ths[i]:.5f}  "
+                  f"iv_rmse={evals['iv_rmse']:.4f}")
+
+    elapsed = _time.time() - t0
+    if verbose:
+        print(f"  [full_polish] done in {elapsed*1000:.1f} ms")
+
+    return {
+        "model_name": model.name + " (polished update)",
+        "objective":  objective.__name__,
+        "expiries":   [sl["t"] for sl in slices],
+        "params":     params_out,
+        "metrics":    metrics_out,
+        "n_points":   [len(df[df["t"] == sl["t"]]) for sl in slices],
+        "_model":     model,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # REPORTING
 # ─────────────────────────────────────────────────────────────────────────────

@@ -24,6 +24,10 @@ Models implemented
 from abc import ABC, abstractmethod
 import numpy as np
 from scipy.stats import norm
+from scipy.linalg import solve_banded
+from scipy.optimize import brentq
+from scipy.interpolate import interp1d
+from scipy.special import ndtr as _ndtr  # ~50× faster than scipy.stats.norm.cdf
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -554,15 +558,16 @@ class eSSVI(VolModel):
         g     = (1 - k * dW / (2 * W))**2 - (dW**2 / 4) * (1/W + 0.25) + d2W / 2
         return float(np.min(g))
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL REGISTRY  —  add new models here
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODELS = {
-    "svi":  RawSVI,
-    "ssvi": SSVI,
-    "sabr": SABR,
-    'essvi':eSSVI
+    "svi":      RawSVI,
+    "ssvi":     SSVI,
+    "sabr":     SABR,
+    "essvi":    eSSVI,
 }
 
 
@@ -572,13 +577,12 @@ def get_model(name: str, **kwargs) -> VolModel:
 
     Parameters
     ----------
-    name   : str   one of 'svi', 'ssvi', 'sabr'
+    name   : str   one of 'svi', 'ssvi', 'sabr', 'essvi'
     kwargs : passed to the model constructor (e.g. beta=1.0 for SABR)
 
     Example
     -------
-    model = get_model("sabr", beta=1.0)
-    model = get_model("svi")
+    model = get_model("sabr")
     """
     key = name.lower()
     if key not in MODELS:

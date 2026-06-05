@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 # --- CONFIGURATION ---
-POLLING_INTERVAL_SECONDS = 1  # Adjust to 3600 for hourly intervals
+POLLING_INTERVAL_SECONDS = 60  # Adjust to 3600 for hourly intervals
 BASE_URL = 'https://www.deribit.com/api/v2'
 TARGET_COLUMNS = [
     'bid_price', 'ask_price', 'open_interest', 'mark_price', 'creation_timestamp_x', 
@@ -114,11 +114,11 @@ def save_to_csv(df: pd.DataFrame) -> None:
         return
         
     # Generate timestamped filename: btc_option_data_YYYY-MM-DD_HHhmm.csv
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"eth_{timestamp}.csv"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    filename = f"btc_{timestamp}.csv"
     
     # Save to the current directory (or change to 'data/' if needed)
-    path = r'/Users/macbookair/Internship Natixis/data/market_making_data/'
+    path = r'/Users/macbookair/Internship Natixis/data/btc/'
     df.to_csv(path+filename, index=False)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Saved data to {filename}")
 

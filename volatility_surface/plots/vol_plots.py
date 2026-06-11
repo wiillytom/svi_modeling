@@ -22,7 +22,7 @@ import matplotlib.colors as mcolors
 from matplotlib.cm import ScalarMappable
 from scipy.interpolate import PchipInterpolator
 
-from vol_models import VolModel, get_model
+from volatility_surface.models.vol_models import VolModel, get_model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ def _scatter_market(ax, df_slice, t):
                    label="Ask", zorder=4)
     elif "mark_iv" in df_slice.columns:
         ax.scatter(df_slice["k"], df_slice['mark_iv'] * 100,
-                   color="white", s=14, alpha=0.6, marker="o",
+                   color="black", s=14, alpha=0.6, marker="o",
                    label="Mid", zorder=4)
 
 
@@ -82,8 +82,8 @@ def plot_surface(result: dict, k_range=(-2.0, 2.0), n_k=200, n_t=100,
 
     T_mesh, K_mesh = np.meshgrid(t_grid, k_grid, indexing="ij")
 
-    fig = plt.figure(figsize=figsize, facecolor="#0d0d0d")
-    ax  = fig.add_subplot(111, projection="3d", facecolor="#0d0d0d")
+    fig = plt.figure(figsize=figsize, facecolor="white")
+    ax  = fig.add_subplot(111, projection="3d", facecolor="white")
 
     surf = ax.plot_surface(K_mesh, T_mesh, iv_surface, cmap=colormap,
                            linewidth=0, antialiased=True, alpha=0.92,
@@ -91,22 +91,22 @@ def plot_surface(result: dict, k_range=(-2.0, 2.0), n_k=200, n_t=100,
 
     for t_exp, p in zip(expiries, params_list):
         iv_atm = model.iv(np.array([0.0]), p, t_exp)[0]
-        ax.scatter(0.0, t_exp, iv_atm, color="white", s=18, zorder=5)
+        ax.scatter(0.0, t_exp, iv_atm, color="black", s=18, zorder=5)
 
     cbar = fig.colorbar(surf, ax=ax, shrink=0.45, pad=0.08)
-    cbar.set_label("Implied Vol", color="white", fontsize=9)
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
+    cbar.set_label("Implied Vol", color="black", fontsize=9)
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="black")
 
-    ax.set_xlabel("Log-strike  k", color="white", labelpad=8)
-    ax.set_ylabel("Time to expiry  T", color="white", labelpad=8)
-    ax.set_zlabel("Implied Vol  σ", color="white", labelpad=8)
+    ax.set_xlabel("Log-strike  k", color="black", labelpad=8)
+    ax.set_ylabel("Time to expiry  T", color="black", labelpad=8)
+    ax.set_zlabel("Implied Vol  σ", color="black", labelpad=8)
     ax.set_title(f"{result['model_name']} — Implied Volatility Surface",
-                 color="white", fontsize=12, pad=14)
+                 color="black", fontsize=12, pad=14)
 
     for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
         pane.fill = False
         pane.set_edgecolor("#333333")
-    ax.tick_params(colors="white")
+    ax.tick_params(colors="black")
     fig.tight_layout()
     return fig
 
@@ -129,7 +129,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
     if figsize is None:
         figsize = (5.5 * n_cols, 4.2 * n_rows)
 
-    fig    = plt.figure(figsize=figsize, facecolor="#111111")
+    fig    = plt.figure(figsize=figsize, facecolor="#ffffff")
     colors = [0.994324, 0.716681, 0.177208, 1.      ]#plt.cm.plasma(np.linspace(0.5, 1.25, n_slices))
 
     for idx, (t_exp, p) in enumerate(zip(expiries, params_list)):
@@ -163,14 +163,14 @@ def plot_slices(result: dict, df=None, n_cols=3,
         if has_neg:
             title_str += "  ⚠ neg RND"
 
-        ax_iv.set_title(title_str, color="white", fontsize=8.5, pad=5)
-        ax_iv.set_xlabel("Log-strike  k", color="#aaaaaa", fontsize=7.5)
+        ax_iv.set_title(title_str, color="black", fontsize=8.5, pad=5)
+        ax_iv.set_xlabel("Log-strike  k", color="#111111", fontsize=7.5)
         ax_iv.set_ylabel("Impl. Vol (%)", color=colors, fontsize=7.5)
         ax_rnd.set_ylabel("RND", color=rnd_color, fontsize=7.5)
-        ax_iv.tick_params(colors="#aaaaaa", labelsize=7)
+        ax_iv.tick_params(colors="#111111", labelsize=7)
         ax_iv.tick_params(axis="y", colors=colors)
         ax_rnd.tick_params(colors=rnd_color, labelsize=7)
-        ax_iv.set_facecolor("#1a1a1a")
+        ax_iv.set_facecolor("#ffffff")
         for spine in list(ax_iv.spines.values()) + list(ax_rnd.spines.values()):
             spine.set_edgecolor("#333333")
 
@@ -179,16 +179,16 @@ def plot_slices(result: dict, df=None, n_cols=3,
                      + ax_rnd.get_legend_handles_labels()[0])
             labels = (ax_iv.get_legend_handles_labels()[1]
                       + ax_rnd.get_legend_handles_labels()[1])
-            ax_iv.legend(lines, labels, fontsize=6.5, facecolor="#1a1a1a",
-                         edgecolor="#444444", labelcolor="white", loc="upper right")
+            ax_iv.legend(lines, labels, fontsize=6.5, facecolor="#ffffff",
+                         edgecolor="#444444", labelcolor="black", loc="upper right")
 
     # Hide unused axes
     for idx in range(n_slices, n_rows * n_cols):
         fig.add_subplot(n_rows, n_cols, idx + 1).set_visible(False)
 
     fig.suptitle(f"{result['model_name']} — Smile & Risk-Neutral Density",
-                 color="white", fontsize=12, y=1.01)
-    fig.patch.set_facecolor("#111111")
+                 color="black", fontsize=12, y=1.01)
+    fig.patch.set_facecolor("#ffffff")
     fig.tight_layout()
     return fig
 
@@ -214,31 +214,31 @@ def plot_total_variance(result: dict, k_range=(-2.0, 2.0), n_grid=400,
     t_min, t_max = expiries.min(), expiries.max()
     norm = mcolors.Normalize(vmin=t_min, vmax=t_max)
 
-    fig, ax = plt.subplots(figsize=figsize, facecolor="#111111")
-    ax.set_facecolor("#1a1a1a")
+    fig, ax = plt.subplots(figsize=figsize, facecolor="#ffffff")
+    ax.set_facecolor("#ffffff")
 
     for t_exp, p in zip(expiries, params_list):
         color = colormap(norm(t_exp))
         ax.plot(k_grid, model.w(k_grid, p), color=color, lw=1.4, alpha=0.85)
 
     ax.axvline(0, color="#555555", lw=0.8, ls="--")
-    ax.set_xlabel("Log-strike  k", color="white")
-    ax.set_ylabel("Total implied variance  w = σ²T", color="white")
+    ax.set_xlabel("Log-strike  k", color="black")
+    ax.set_ylabel("Total implied variance  w = σ²T", color="black")
     ax.set_title(f"{result['model_name']} — Total Variance (no lines should cross)",
-                 color="white")
-    ax.tick_params(colors="#aaaaaa")
+                 color="black")
+    ax.tick_params(colors="#111111")
     for spine in ax.spines.values():
         spine.set_edgecolor("#333333")
 
     sm   = ScalarMappable(cmap=colormap, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, pad=0.02, fraction=0.03)
-    cbar.set_label("Time to expiry  T (years)", color="white", fontsize=9)
+    cbar.set_label("Time to expiry  T (years)", color="black", fontsize=9)
     tick_vals = np.linspace(t_min, t_max, n_cbar_ticks)
     cbar.set_ticks(tick_vals)
     cbar.set_ticklabels([f"{t:.3f}" for t in tick_vals])
-    cbar.ax.yaxis.set_tick_params(color="white", labelsize=7.5)
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
+    cbar.ax.yaxis.set_tick_params(color="black", labelsize=7.5)
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="black")
     cbar.outline.set_edgecolor("#444444")
 
     fig.tight_layout()
@@ -262,7 +262,7 @@ def plot_metrics(result: dict, figsize=None) -> plt.Figure:
     if figsize is None:
         figsize = (5 * n_metrics, 4)
 
-    fig, axes = plt.subplots(1, n_metrics, figsize=figsize, facecolor="#111111")
+    fig, axes = plt.subplots(1, n_metrics, figsize=figsize, facecolor="#ffffff")
     if n_metrics == 1:
         axes = [axes]
 
@@ -273,24 +273,24 @@ def plot_metrics(result: dict, figsize=None) -> plt.Figure:
     for ax, metric in zip(axes, metric_names):
         vals = metrics_dict[metric]
         bars = ax.bar(x, vals, color=colors, edgecolor="#333333", linewidth=0.5)
-        ax.set_facecolor("#1a1a1a")
-        ax.set_title(metric, color="white", fontsize=9)
+        ax.set_facecolor("#ffffff")
+        ax.set_title(metric, color="black", fontsize=9)
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=45, ha="right",
-                           color="#aaaaaa", fontsize=7)
-        ax.tick_params(colors="#aaaaaa")
-        ax.set_xlabel("Expiry T", color="#aaaaaa", fontsize=8)
+                           color="#111111", fontsize=7)
+        ax.tick_params(colors="#111111")
+        ax.set_xlabel("Expiry T", color="#111111", fontsize=8)
         for spine in ax.spines.values():
             spine.set_edgecolor("#333333")
 
         mean_val = np.nanmean(vals)
-        ax.axhline(mean_val, color="white", lw=1.0, ls="--", alpha=0.6)
+        ax.axhline(mean_val, color="black", lw=1.0, ls="--", alpha=0.6)
         ax.text(len(expiries) - 0.5, mean_val * 1.02,
-                f"mean={mean_val:.4f}", color="white", fontsize=6.5, ha="right")
+                f"mean={mean_val:.4f}", color="black", fontsize=6.5, ha="right")
 
     fig.suptitle(f"{result['model_name']} — Fit Metrics by Expiry",
-                 color="white", fontsize=11, y=1.02)
-    fig.patch.set_facecolor("#111111")
+                 color="black", fontsize=11, y=1.02)
+    fig.patch.set_facecolor("#ffffff")
     fig.tight_layout()
     return fig
 
@@ -325,12 +325,12 @@ def plot_compare(results: list, df=None, t_exp: float = None,
     colors = plt.cm.tab10(np.linspace(0, 0.9, len(results)))
 
     fig, (ax_iv, ax_rnd) = plt.subplots(2, 1, figsize=figsize,
-                                         facecolor="#111111", sharex=True)
+                                         facecolor="#ffffff", sharex=True)
     for ax in [ax_iv, ax_rnd]:
-        ax.set_facecolor("#1a1a1a")
+        ax.set_facecolor("#ffffff")
         for spine in ax.spines.values():
             spine.set_edgecolor("#333333")
-        ax.tick_params(colors="#aaaaaa")
+        ax.tick_params(colors="#111111")
 
     # Market observations on both
     _scatter_market(ax_iv, df_slice, t_exp)
@@ -354,16 +354,16 @@ def plot_compare(results: list, df=None, t_exp: float = None,
     for ax in [ax_iv, ax_rnd]:
         ax.axvline(0, color="#555555", lw=0.8, ls="--")
 
-    ax_iv.set_ylabel("Implied Vol (%)", color="white")
-    ax_rnd.set_ylabel("Risk-Neutral Density", color="white")
-    ax_rnd.set_xlabel("Log-strike  k", color="white")
-    ax_iv.legend(fontsize=7.5, facecolor="#1a1a1a", edgecolor="#444444",
-                 labelcolor="white")
+    ax_iv.set_ylabel("Implied Vol (%)", color="black")
+    ax_rnd.set_ylabel("Risk-Neutral Density", color="black")
+    ax_rnd.set_xlabel("Log-strike  k", color="black")
+    ax_iv.legend(fontsize=7.5, facecolor="#ffffff", edgecolor="#444444",
+                 labelcolor="black")
 
     days = t_exp * 365.25
     fig.suptitle(f"Model comparison — T={t_exp:.4f} ({days:.1f}d)",
-                 color="white", fontsize=11)
-    fig.patch.set_facecolor("#111111")
+                 color="black", fontsize=11)
+    fig.patch.set_facecolor("#ffffff")
     fig.tight_layout()
     return fig
 

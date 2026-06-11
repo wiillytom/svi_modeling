@@ -57,7 +57,7 @@ def _bs_call_price(k, mark_iv, t):
     mark_iv = np.asarray(mark_iv, dtype=float)
     k       = np.asarray(k,       dtype=float)
     mark_iv = np.maximum(mark_iv, 1e-8)           # guard against zero IV
-    sqt     = np.sqrt(max(t, 1e-10))
+    sqt     = np.sqrt(np.maximum(np.asarray(t, dtype=float), 1e-10))
     d1      = -k / (mark_iv * sqt) + mark_iv * sqt / 2
     d2      = d1 - mark_iv * sqt
     price   = _norm.cdf(d1) - np.exp(k) * _norm.cdf(d2)
@@ -142,7 +142,8 @@ def _bs_vega(k, iv, t):
     return sqt * np.exp(k) * _norm.pdf(d1)
 
 
-def obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None, vegas=None):
+def obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t,
+                     spreads=None, vegas=None, bid=None, ask=None):
     """
     Vega-weighted MSE on implied vol (Gatheral VW4, slide 'Choice of objective').
 
@@ -175,6 +176,10 @@ def obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None, vegas=Non
     vega    = np.asarray(vegas, dtype=float) if vegas is not None else _bs_vega(k, iv_obs, t)
     vega_sq = vega ** 2
 
+    # Derive spreads from bid/ask if not provided directly.
+    if spreads is None and bid is not None and ask is not None:
+        spreads = np.asarray(ask, dtype=float) - np.asarray(bid, dtype=float)
+
     if spreads is not None and not np.all(spreads == 0):
         spread_sq = np.maximum(spreads, 1e-6) ** 2
         weights   = vega_sq / spread_sq       # vega²/spread²: ATM + liquidity
@@ -187,13 +192,103 @@ def obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None, vegas=Non
 
     return float(np.nansum(weights * (iv_fit - iv_obs) ** 2) / w_sum)
 
+
+def obj_band_loss(w_fit, w_obs, iv_fit, iv_obs, k, t,
+                  spreads=None, vegas=None, bid=None, ask=None,
+                  vega_weight=False, mid_anchor=0.0):
+    """
+    Bid-ask band loss — directly targets "stay inside the IV book".
+
+    Loss per point is zero when iv_fit is inside [bid, ask], and quadratic
+    in the excess otherwise:
+
+        L_i = max(0, iv_fit_i - ask_i)^2 + max(0, bid_i - iv_fit_i)^2
+
+    This is a smooth, differentiable proxy for maximising the hit-rate.
+    Unlike `iv_rmse`, it does not pull the fit toward `mark_iv` — once the
+    smile is inside the book the gradient vanishes, so the optimiser is
+    free to balance other constraints (no-arb penalties, smoothness, etc.).
+
+    Parameters
+    ----------
+    vega_weight : bool
+        If True, weight each point by vega^2 so ATM (tight, liquid)
+        contracts dominate. Recommended for crypto where deep-wing IV
+        spreads are huge and would otherwise let wings drift far.
+    mid_anchor : float, optional
+        Small coefficient (e.g. 1e-4) on a tiebreaker term that pulls
+        iv_fit toward the mid (bid+ask)/2 when already inside the band.
+        Keeps the smile from drifting to a corner of the band on
+        under-determined slices. Set to 0 to disable.
+
+    Falls back to `iv_mse` if bid/ask are not provided.
+    """
+    if bid is None or ask is None:
+        return obj_iv_mse(w_fit, w_obs, iv_fit, iv_obs, k, t)
+
+    iv_fit = np.asarray(iv_fit, dtype=float)
+    bid    = np.asarray(bid,    dtype=float)
+    ask    = np.asarray(ask,    dtype=float)
+
+    above = np.maximum(0.0, iv_fit - ask)
+    below = np.maximum(0.0, bid - iv_fit)
+    per_point = above ** 2 + below ** 2
+
+    if mid_anchor and mid_anchor > 0:
+        mid = 0.5 * (bid + ask)
+        per_point = per_point + mid_anchor * (iv_fit - mid) ** 2
+
+    if vega_weight:
+        vega = (np.asarray(vegas, dtype=float)
+                if vegas is not None else _bs_vega(k, iv_obs, t))
+        weights = vega ** 2
+        wsum    = np.nansum(weights)
+        if wsum < 1e-30:
+            return float(np.nanmean(per_point))
+        return float(np.nansum(weights * per_point) / wsum)
+
+    return float(np.nanmean(per_point))
+
+
+def obj_vega_wmse_band(w_fit, w_obs, iv_fit, iv_obs, k, t,
+                       spreads=None, vegas=None, bid=None, ask=None,
+                       band_weight=10.0):
+    """
+    Hybrid: vega-weighted MSE on (iv_fit − mark_iv), PLUS an additive band
+    penalty that fires only when iv_fit leaves [bid, ask].
+
+        L = vega_wmse(iv_fit, iv_obs) + band_weight · band_loss(iv_fit, bid, ask)
+
+    This keeps a strong gradient everywhere (from vega_wmse) so low-parameter
+    models like SABR don't ping-pong between local minima, while still
+    explicitly penalising any drift outside the IV book. The band_weight
+    controls how aggressively the fit is dragged inside the spread.
+
+    Falls back to pure vega_wmse if bid/ask are not provided.
+    """
+    base = obj_iv_vega_wmse(w_fit, w_obs, iv_fit, iv_obs, k, t,
+                            spreads=spreads, vegas=vegas)
+    if bid is None or ask is None:
+        return base
+
+    iv_fit = np.asarray(iv_fit, dtype=float)
+    bid    = np.asarray(bid,    dtype=float)
+    ask    = np.asarray(ask,    dtype=float)
+    above  = np.maximum(0.0, iv_fit - ask)
+    below  = np.maximum(0.0, bid - iv_fit)
+    band   = float(np.nanmean(above ** 2 + below ** 2))
+    return base + band_weight * band
+
+
 OBJECTIVES = {
-    "w_mse":      obj_w_mse,
-    "iv_mse":     obj_iv_mse,
-    "iv_wmse":    obj_iv_wmse,
-    "price_mse":  obj_price_mse,
-    "iv_rmse":    obj_iv_rmse,
-    "vega_wmse": obj_iv_vega_wmse
+    "w_mse":           obj_w_mse,
+    "iv_mse":          obj_iv_mse,
+    "iv_wmse":         obj_iv_wmse,
+    "price_mse":       obj_price_mse,
+    "iv_rmse":         obj_iv_rmse,
+    "vega_wmse":       obj_iv_vega_wmse,
+    "band":            obj_band_loss,
+    "vega_wmse_band":  obj_vega_wmse_band,
 }
 
 
@@ -208,43 +303,65 @@ def get_objective(name: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # EVALUATION METRICS
 # Each returns a scalar for reporting — not used during optimisation.
-# Signature: f(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None) -> float
+# Signature: f(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None) -> float
 # ─────────────────────────────────────────────────────────────────────────────
 
-def metric_iv_rmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
+def metric_iv_rmse(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None):
     """Absolute RMSE on implied vol (in vol points)."""
     return float(np.sqrt(np.nanmean((iv_fit - iv_obs) ** 2)))
 
 
-def metric_iv_rrmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
+def metric_iv_rrmse(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None):
     """Relative RMSE on implied vol (as fraction of observed iv)."""
     rel = (iv_fit - iv_obs) / np.maximum(iv_obs, 1e-6)
     return float(np.sqrt(np.nanmean(rel ** 2)))
 
 
-def metric_price_rmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
+def metric_price_rmse(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None):
     """Absolute RMSE on call prices."""
     prices_fit = _prices_from_iv(k, iv_fit, t)
     prices_obs = _prices_from_iv(k, iv_obs, t)
     return float(np.sqrt(np.nanmean((prices_fit - prices_obs) ** 2)))
 
 
-def metric_price_rrmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
+def metric_price_rrmse(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None):
     """Relative RMSE on call prices."""
     prices_fit = _prices_from_iv(k, iv_fit, t)
     prices_obs = _prices_from_iv(k, iv_obs, t)
     rel = (prices_fit - prices_obs) / np.maximum(prices_obs, 1e-8)
     return float(np.sqrt(np.nanmean(rel ** 2)))
 
+def metric_spread_hit_rate(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None):
+    """
+    Fraction of fitted IVs that fall inside the observed bid-ask IV spread.
+    `bid` and `ask` here are expected to be bid_iv / ask_iv arrays
+    (not bid_price / ask_price) to avoid call/put + forward/spot ambiguity
+    introduced by converting through Black-Scholes.
+    """
+    if bid is None or ask is None:
+        return float("nan")
+    bid = np.asarray(bid, dtype=float)
+    ask = np.asarray(ask, dtype=float)
+    inside = (iv_fit >= bid) & (iv_fit <= ask)
+    valid = np.isfinite(iv_fit) & np.isfinite(bid) & np.isfinite(ask)
+    if not valid.any():
+        return float("nan")
+    return float(np.mean(inside[valid]))
 
-def metric_w_rmse(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
+def metric_w_rmse(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None):
     """Absolute RMSE on total variance."""
     return float(np.sqrt(np.nanmean((w_fit - w_obs) ** 2)))
 
 
-def metric_max_iv_err(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads=None):
+def metric_max_iv_err(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None):
     """Maximum absolute error on implied vol across all strikes."""
     return float(np.nanmax(np.abs(iv_fit - iv_obs)))
+
+def metric_iv_vwrmse(w_fit, w_obs, iv_fit, iv_obs, k, t, bid=None, ask=None):
+    vega = _bs_vega(k, iv_obs, t)
+    num  = np.nansum(vega * (iv_fit - iv_obs) ** 2)
+    den  = np.nansum(vega)
+    return float(np.sqrt(num / den)) if den > 0 else np.nan
 
 
 METRICS = {
@@ -254,10 +371,12 @@ METRICS = {
     "price_rrmse":  metric_price_rrmse,
     "w_rmse":       metric_w_rmse,
     "max_iv_err":   metric_max_iv_err,
+    "spread_hit_rate": metric_spread_hit_rate,
+    "vwrmse":   metric_iv_vwrmse
 }
 
 # Default set reported after every calibration
-DEFAULT_METRICS = ["iv_rmse", "iv_rrmse", "price_rmse", "w_rmse"]
+DEFAULT_METRICS = ["iv_rrmse", "spread_hit_rate", 'price_rrmse', "w_rmse", "vwrmse"]
 
 
 def get_metric(name: str):
@@ -269,16 +388,18 @@ def get_metric(name: str):
 
 
 def evaluate_all(w_fit, w_obs, iv_fit, iv_obs, k, t,
-                 spreads=None, metric_names=None) -> dict:
+                 bid=None, ask=None, metric_names=None) -> dict:
     """
     Compute all (or a subset of) metrics and return as a dict.
 
     Parameters
     ----------
+    bid, ask     : arrays of observed bid/ask prices (optional, used by
+                   spread-based metrics like spread_hit_rate)
     metric_names : list of str or None  (None = DEFAULT_METRICS)
     """
-    names = metric_names or DEFAULT_METRICS
+    names = metric_names if metric_names is not None else DEFAULT_METRICS
     return {
-        name: get_metric(name)(w_fit, w_obs, iv_fit, iv_obs, k, t, spreads)
+        name: get_metric(name)(w_fit, w_obs, iv_fit, iv_obs, k, t, bid, ask)
         for name in names
     }

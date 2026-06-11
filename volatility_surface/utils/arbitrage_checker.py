@@ -138,17 +138,34 @@ def _build_surface(result, n_strikes, n_times, dk=_DK, dt=_DT):
     # PCHIP across maturities, evaluated on the dense t grid.
     # axis=0 means "interpolate along the first axis of the y-array",
     # which is the expiries axis once we transpose to shape (n_e, n_strikes).
-    interp_mid   = PchipInterpolator(expiries, W_mid_e.T, axis=0, extrapolate=True)
-    interp_plus  = PchipInterpolator(expiries, W_p_e  .T, axis=0, extrapolate=True)
-    interp_minus = PchipInterpolator(expiries, W_m_e  .T, axis=0, extrapolate=True)
+    #
+    # Extrapolate is intentionally disabled (extrapolate=False): PCHIP extends
+    # via the first/last-segment cubic, whose slope at the boundary can be
+    # negative even when the knot values are monotone in t.  Evaluating at
+    # t < expiries.min() (which happens when we compute t_grid[0] - dt) then
+    # injects spurious negative ∂w/∂t at the lower edge of the grid — a pure
+    # FD artefact, unrelated to any real arbitrage in the fitted surface.
+    # We use one-sided FD at the t boundaries instead.
+    interp_mid   = PchipInterpolator(expiries, W_mid_e.T, axis=0, extrapolate=False)
+    interp_plus  = PchipInterpolator(expiries, W_p_e  .T, axis=0, extrapolate=False)
+    interp_minus = PchipInterpolator(expiries, W_m_e  .T, axis=0, extrapolate=False)
+
+    # Clamp the offset t-points to the fitted range, then divide by the
+    # *actual* step so each row uses central FD in the interior and forward /
+    # backward FD at the boundaries — exactly the np.gradient convention.
+    t_plus  = np.minimum(t_grid + dt, t_grid[-1])
+    t_minus = np.maximum(t_grid - dt, t_grid[0])
+    dt_eff  = (t_plus - t_minus)                          # shape (n_times,)
+    # Avoid 0/0 if n_times == 1 (degenerate but defensible)
+    dt_eff  = np.where(dt_eff > 0.0, dt_eff, 1.0)
 
     W   = interp_mid  (t_grid).T            # at (k_grid,  t_grid)
     Wp  = interp_plus (t_grid).T            # at (k_grid+dk, t_grid)
     Wm  = interp_minus(t_grid).T            # at (k_grid-dk, t_grid)
-    Wtp = interp_mid  (t_grid + dt).T       # at (k_grid,  t_grid+dt)
-    Wtm = interp_mid  (t_grid - dt).T       # at (k_grid,  t_grid-dt)
+    Wtp = interp_mid  (t_plus).T            # at (k_grid,  min(t+dt, t_max))
+    Wtm = interp_mid  (t_minus).T           # at (k_grid,  max(t-dt, t_min))
 
-    dwdt   = (Wtp - Wtm) / (2.0 * dt)
+    dwdt   = (Wtp - Wtm) / dt_eff[np.newaxis, :]
     dwdk   = (Wp  - Wm ) / (2.0 * dk)
     d2wdk2 = (Wp - 2.0 * W + Wm) / (dk * dk)
 

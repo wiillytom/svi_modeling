@@ -33,8 +33,8 @@ import warnings
 import time as _time
 warnings.filterwarnings("ignore")
 
-from vol_models import VolModel, RawSVI, get_model
-from objectives import get_objective, evaluate_all, DEFAULT_METRICS
+from volatility_surface.models.vol_models import VolModel, RawSVI, get_model
+from volatility_surface.core.calibration.objectives import get_objective, evaluate_all, DEFAULT_METRICS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -296,6 +296,8 @@ def calibrate_snapshot(
     vega_col:             str      = None,
     bid_col:              str      = None,
     ask_col:              str      = None,
+    enforce_arbfree:      bool     = False,
+    arbfree_tol:          float    = 1e-6,
     verbose:              bool     = True,
 ) -> dict:
     """
@@ -310,6 +312,12 @@ def calibrate_snapshot(
     spread_col    : column in df with bid-ask vol spread (optional)
     penalty_cal   : calendar spread penalty weight
     penalty_but   : butterfly arbitrage penalty weight
+    enforce_arbfree : if True, runs enforce_calendar_arbfree on the result —
+                      if any adjacent pair still has crossedness > arbfree_tol,
+                      the surface is refitted jointly with strong calendar
+                      enforcement (model-specific path; currently supported
+                      for SABR). Use with per-slice models like SABR.
+    arbfree_tol   : tolerance used by enforce_arbfree (default 1e-6)
 
     Returns
     -------
@@ -380,7 +388,7 @@ def calibrate_snapshot(
         w_fit  = model.w(k_obs, params)
         iv_fit = model.iv(k_obs, params, t_exp)
         evals  = evaluate_all(w_fit, w_obs, iv_fit, iv_obs, k_obs, t_exp,
-                               spreads=spreads, metric_names=metric_names)
+                               bid=bid, ask=ask, metric_names=metric_names)
         for m in metric_names:
             slice_metrics[m].append(evals[m])
 
@@ -400,7 +408,7 @@ def calibrate_snapshot(
     metrics_out  = {m: [slice_metrics[m][i] for i in valid_idx] for m in metric_names}
     n_pts        = [len(df[df["t"] == t]) for t in expiries_out]
 
-    return {
+    result = {
         "model_name": model.name,
         "objective":  objective.__name__,
         "expiries":   expiries_out,
@@ -409,6 +417,19 @@ def calibrate_snapshot(
         "n_points":   n_pts,
         "_model":     model,   # kept for plotting
     }
+
+    if enforce_arbfree and len(params_out) >= 2:
+        result = enforce_calendar_arbfree(
+            result, df,
+            objective=objective,
+            tol=arbfree_tol,
+            verbose=verbose,
+            vega_col=vega_col,
+            bid_col=bid_col,
+            ask_col=ask_col,
+        )
+
+    return result
 
 
 
@@ -789,6 +810,7 @@ def calibrate_global_essvi(
     metrics_out = {m: [] for m in DEFAULT_METRICS}
 
     for i, sl in enumerate(slices):
+
         p = {
             "theta":   float(thetas[i]),
             "eta":     float(etas[i]),
@@ -801,7 +823,8 @@ def calibrate_global_essvi(
 
         w_fit  = model.w(sl["k"], p)
         iv_fit = model.iv(sl["k"], p, sl["t"])
-        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"])
+        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"],
+                              bid=sl.get("bid"), ask=sl.get("ask"))
         for m in DEFAULT_METRICS:
             metrics_out[m].append(evals[m])
 
@@ -860,7 +883,7 @@ def calibrate_global_ssvi(
     - Warm-start pools per-slice SSVI fits and takes the median eta/gamma/rho.
     - DE budget can be larger than eSSVI (13 params vs 33 for n=10).
     """
-    from vol_models import get_model as _get_model
+    from volatility_surface.models.vol_models import get_model as _get_model
 
     if model is None:
         model = _get_model("ssvi")
@@ -1030,7 +1053,8 @@ def calibrate_global_ssvi(
 
         w_fit  = model.w(sl["k"], p)
         iv_fit = model.iv(sl["k"], p, sl["t"])
-        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"])
+        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"],
+                              bid=sl.get("bid"), ask=sl.get("ask"))
         for m in DEFAULT_METRICS:
             metrics_out[m].append(evals[m])
 
@@ -1051,6 +1075,411 @@ def calibrate_global_ssvi(
         "n_points":   [len(df[df["t"] == sl["t"]]) for sl in slices],
         "_model":     model,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL SABR  (per-slice params, joint calendar-arb enforcement)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calibrate_global_sabr(
+    df:           pd.DataFrame,
+    model         = None,
+    objective     = None,
+    penalty_cal:  float = 5000.0,
+    penalty_but:  float = 200.0,
+    n_cal_grid:   int   = 200,
+    cal_k_range:  tuple = (-3.0, 3.0),
+    vega_col:     str   = None,
+    bid_col:      str   = None,
+    ask_col:      str   = None,
+    warm_start:   dict  = None,
+    max_escalations: int = 3,
+    verbose:      bool  = True,
+) -> dict:
+    """
+    Joint global SABR calibration with explicit calendar-spread arbitrage
+    enforcement.
+
+    SABR has no natural surface-level parametrisation (unlike SSVI's theta
+    monotonicity or eSSVI's rho(theta)), so every (alpha_i, rho_i, nu_i) is
+    fitted per slice — 3*n parameters total — but jointly, so the optimiser
+    sees calendar interactions between adjacent expiries.
+
+    The calendar penalty enforces
+
+        w(k, t_{i+1})  ≥  w(k, t_i)        for every k in cal_k_range
+                                            for every i = 0, ..., n-2
+
+    on a dense k-grid.  The Hagan SABR approximation is essentially always
+    butterfly-free on the relevant (k, t) range, but a small butterfly
+    penalty is kept as a safety net.
+
+    Escalation
+    ----------
+    If the first joint NM polish still leaves calendar crossedness > 1e-6
+    on any adjacent pair, the calendar penalty is multiplied by 10 and the
+    fit is repeated, up to ``max_escalations`` times (default 3 → up to
+    1000× the base penalty).  This recovers arb-freedom without sacrificing
+    fit on pairs that were already fine.
+
+    Parameters
+    ----------
+    df            : snapshot dataframe (output of load_snapshot)
+    model         : SABR instance  (default: get_model("sabr"))
+    objective     : callable or string  (default: "iv_wmse")
+    penalty_cal   : base weight on integrated calendar crossedness
+    penalty_but   : per-slice butterfly penalty (safety net)
+    n_cal_grid    : number of k-points used in the calendar penalty
+    cal_k_range   : (k_min, k_max) range for the calendar penalty grid
+    warm_start    : optional previous result dict; if given, its params are
+                    used as the per-slice starting point (nearest-T match),
+                    skipping the per-slice warm-start phase.
+    max_escalations : maximum number of penalty bump rounds.
+
+    Returns
+    -------
+    Same result-dict format as calibrate_snapshot.
+    """
+    from volatility_surface.models.vol_models import get_model as _get_model
+
+    if model is None:
+        model = _get_model("sabr")
+    if model.name != "SABR":
+        raise ValueError(f"calibrate_global_sabr expects a SABR model, got {model.name!r}")
+    if objective is None:
+        objective = get_objective("iv_wmse")
+    elif isinstance(objective, str):
+        objective = get_objective(objective)
+
+    expiries = sorted(df["t"].unique())
+    n        = len(expiries)
+    if n < 2:
+        raise ValueError("calibrate_global_sabr needs at least 2 expiries.")
+
+    # ── Build per-slice data ──────────────────────────────────────────────────
+    slices = []
+    for t in expiries:
+        sub = df[df["t"] == t]
+        slices.append({
+            "t":    t,
+            "k":    sub["k"].values,
+            "w":    sub["w"].values,
+            "iv":   sub["mark_iv"].values,
+            "vegas": sub[vega_col].values if vega_col and vega_col in df.columns else None,
+            "bid":   sub[bid_col].values  if bid_col  and bid_col  in df.columns else None,
+            "ask":   sub[ask_col].values  if ask_col  and ask_col  in df.columns else None,
+        })
+
+    slice_objectives = [
+        _bind_extra(objective, vegas=sl["vegas"], bid=sl["bid"], ask=sl["ask"])
+        for sl in slices
+    ]
+
+    # ── Warm-start ────────────────────────────────────────────────────────────
+    init_alphas = np.empty(n)
+    init_rhos   = np.empty(n)
+    init_nus    = np.empty(n)
+
+    if warm_start is not None and "params" in warm_start:
+        ws_T = np.asarray(warm_start["expiries"], dtype=float)
+        ws_p = warm_start["params"]
+        for i, t in enumerate(expiries):
+            p = ws_p[int(np.argmin(np.abs(ws_T - t)))]
+            init_alphas[i] = float(p.get("alpha", 0.5))
+            init_rhos[i]   = float(p.get("rho",   -0.5))
+            init_nus[i]    = float(p.get("nu",    0.5))
+        if verbose:
+            print(f"  warm-start from provided result ({len(ws_p)} slices)")
+    else:
+        if verbose:
+            print(f"  SABR per-slice warm-start (DE+NM, {n} slices) ...")
+            _t_ws = _time.time()
+        for i, sl in enumerate(slices):
+            try:
+                p = fit_single_slice(
+                    sl["k"], sl["w"], sl["iv"], sl["t"],
+                    model=model,
+                    objective=slice_objectives[i],
+                    use_global_init=True,
+                )
+                init_alphas[i] = p["alpha"]
+                init_rhos[i]   = p["rho"]
+                init_nus[i]    = p["nu"]
+            except Exception:
+                atm_w  = float(np.interp(0.0, np.sort(sl["k"]),
+                                          sl["w"][np.argsort(sl["k"])]))
+                init_alphas[i] = float(np.sqrt(max(atm_w / sl["t"], 1e-6)))
+                init_rhos[i]   = -0.5
+                init_nus[i]    = 0.5
+        if verbose:
+            print(f"  warm-start done in {_time.time()-_t_ws:.1f}s")
+
+    # ── Dense k-grid for the calendar penalty ─────────────────────────────────
+    k_cal = np.linspace(cal_k_range[0], cal_k_range[1], n_cal_grid)
+    dk    = (cal_k_range[1] - cal_k_range[0]) / (n_cal_grid - 1)
+
+    # ── Pack / unpack ─────────────────────────────────────────────────────────
+    # Layout: [log(alpha)_i, arctanh(rho)_i, log(nu)_i]  for i = 0..n-1
+    def pack_global(alphas, rhos, nus):
+        return np.concatenate([
+            np.log(np.maximum(alphas, 1e-9)),
+            np.arctanh(np.clip(rhos, -0.9999, 0.9999)),
+            np.log(np.maximum(nus, 1e-9)),
+        ])
+
+    def unpack_global(x):
+        alphas = np.exp(x[0     : n])
+        rhos   = np.tanh(x[n    : 2*n])
+        nus    = np.exp(x[2*n   : 3*n])
+        return alphas, rhos, nus
+
+    # ── Objective factory (lets us re-bind the penalty on escalation) ─────────
+    def make_objective_fn(pen_cal):
+        def _obj(x):
+            alphas, rhos, nus = unpack_global(x)
+            total = 0.0
+            w_cal = np.empty((n, n_cal_grid))
+
+            for i, sl in enumerate(slices):
+                params = {
+                    "alpha": float(alphas[i]),
+                    "rho":   float(rhos[i]),
+                    "nu":    float(nus[i]),
+                    "t":     sl["t"],
+                }
+                w_fit  = model.w(sl["k"], params)
+                iv_fit = model.iv(sl["k"], params, sl["t"])
+                total += slice_objectives[i](
+                    w_fit, sl["w"], iv_fit, sl["iv"],
+                    sl["k"], sl["t"], None,
+                )
+
+                mg = model.min_g(params)
+                total += max(0.0, -mg) * penalty_but
+
+                w_cal[i] = model.w(k_cal, params)
+
+            # Calendar: integrated crossedness over k for each adjacent pair.
+            # diff = w(k, t_i) - w(k, t_{i+1}) > 0  ⇒  violation.
+            # Use trapezoidal integration of the violation to keep the penalty
+            # smooth in k (no kink-amplification from a max-only metric).
+            for i in range(n - 1):
+                viol = np.maximum(w_cal[i] - w_cal[i+1], 0.0)
+                # area under the violation curve (trapezoidal) — penalises
+                # wide-spread violations
+                area = 0.5 * dk * (viol[0] + viol[-1] + 2.0 * float(viol[1:-1].sum()))
+                # plus a max term — penalises tall localised violations
+                area += float(viol.max())
+                total += area * pen_cal
+
+            return total
+        return _obj
+
+    bounds = (
+        [(np.log(1e-4), np.log(2.0))]  * n +    # log alpha
+        [(-3.5, 3.5)]                  * n +    # arctanh rho
+        [(np.log(1e-4), np.log(10.0))] * n      # log nu
+    )
+
+    if verbose:
+        print(f"\nModel     : SABR (global, per-slice with calendar enforcement)")
+        print(f"Objective : {objective.__name__}")
+        print(f"Slices    : {n}  |  Params: {3*n} total  (3 per slice)")
+        print(f"  calendar grid: {n_cal_grid} pts on k ∈ {cal_k_range}")
+        print(f"  base penalty_cal={penalty_cal}, max_escalations={max_escalations}\n")
+
+    # ── Iterative-penalty optimisation ────────────────────────────────────────
+    x_cur     = pack_global(init_alphas, init_rhos, init_nus)
+    pen_cur   = float(penalty_cal)
+    last_res  = None
+
+    for round_i in range(max_escalations + 1):
+        obj_fn = make_objective_fn(pen_cur)
+        if verbose:
+            print(f"  Round {round_i+1}/{max_escalations+1}: NM polish "
+                  f"(penalty_cal={pen_cur:.1f}) ...")
+            _tp = _time.time()
+
+        res = minimize(
+            obj_fn, x_cur, method="Nelder-Mead",
+            options={
+                "maxiter": max(3000, 800 * n),
+                "xatol":   1e-8,
+                "fatol":   1e-8,
+                "adaptive": True,
+            },
+        )
+        x_cur    = res.x
+        last_res = res
+
+        # Check residual calendar violation on the dense grid
+        alphas, rhos, nus = unpack_global(x_cur)
+        max_viol = 0.0
+        for i in range(n - 1):
+            p_i = {"alpha": float(alphas[i]),   "rho": float(rhos[i]),
+                   "nu":    float(nus[i]),      "t":   slices[i]["t"]}
+            p_j = {"alpha": float(alphas[i+1]), "rho": float(rhos[i+1]),
+                   "nu":    float(nus[i+1]),    "t":   slices[i+1]["t"]}
+            w_i = model.w(k_cal, p_i)
+            w_j = model.w(k_cal, p_j)
+            max_viol = max(max_viol, float(np.max(w_i - w_j)))
+
+        if verbose:
+            print(f"    NM: {_time.time()-_tp:.1f}s  loss={res.fun:.4e}  "
+                  f"worst calendar crossedness = {max_viol:+.3e}")
+
+        if max_viol <= 1e-6 or round_i == max_escalations:
+            break
+        pen_cur *= 10.0
+        if verbose:
+            print(f"    violation > 1e-6 → escalating penalty to {pen_cur:.1f}")
+
+    alphas, rhos, nus = unpack_global(x_cur)
+
+    # ── Build result dict ─────────────────────────────────────────────────────
+    params_out  = []
+    metrics_out = {m: [] for m in DEFAULT_METRICS}
+
+    for i, sl in enumerate(slices):
+        p = {
+            "alpha": float(alphas[i]),
+            "rho":   float(rhos[i]),
+            "nu":    float(nus[i]),
+            "t":     sl["t"],
+        }
+        params_out.append(p)
+        w_fit  = model.w(sl["k"], p)
+        iv_fit = model.iv(sl["k"], p, sl["t"])
+        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"],
+                              bid=sl.get("bid"), ask=sl.get("ask"))
+        for m in DEFAULT_METRICS:
+            metrics_out[m].append(evals[m])
+
+        if verbose:
+            cross = 0.0 if i == 0 else crossedness(
+                model, params_out[i-1], p, k_range=cal_k_range, n=n_cal_grid,
+            )
+            cal_tag = "ok" if cross <= 1e-6 else f"⚠ cal {cross:+.2e}"
+            print(f"  T={sl['t']:.4f}  alpha={p['alpha']:.4f}  "
+                  f"rho={p['rho']:+.3f}  nu={p['nu']:.3f}  "
+                  f"iv_rmse={evals['iv_rmse']:.4f}  [{cal_tag}]")
+
+    return {
+        "model_name": "SABR (global arb-free)",
+        "objective":  objective.__name__,
+        "expiries":   [sl["t"] for sl in slices],
+        "params":     params_out,
+        "metrics":    metrics_out,
+        "n_points":   [len(df[df["t"] == sl["t"]]) for sl in slices],
+        "_model":     model,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALENDAR-ARB-FREE POST-PROCESSOR  (model-agnostic dispatcher)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def enforce_calendar_arbfree(
+    result:       dict,
+    df:           pd.DataFrame,
+    objective     = None,
+    tol:          float = 1e-6,
+    k_range:      tuple = (-3.0, 3.0),
+    n_grid:       int   = 200,
+    verbose:      bool  = True,
+    **kwargs,
+) -> dict:
+    """
+    Project a calibrated surface onto the calendar-arbitrage-free manifold.
+
+    Scans every adjacent expiry pair on a dense k-grid; if any pair has
+        max_k [ w(k, t_i)  -  w(k, t_{i+1}) ]  >  tol
+    the entire surface is refitted jointly with a strong calendar penalty,
+    using the current params as warm-start.
+
+    Currently supported models
+    --------------------------
+        SABR    →  refit via calibrate_global_sabr
+        SSVI / eSSVI  →  already calendar-arb-free by construction (theta
+                         monotonicity) when fitted via calibrate_global_ssvi
+                         / calibrate_global_essvi, so the function is a no-op
+                         and just reports.
+        other   →  raises NotImplementedError.
+
+    Parameters
+    ----------
+    result      : calibration result dict (must contain '_model')
+    df          : the snapshot dataframe used to produce `result`
+    objective   : objective for the refit  (default: same as in `result`)
+    tol         : crossedness tolerance below which a pair is treated as free
+    k_range     : k-range scanned for violations and used in the joint refit
+    n_grid      : grid resolution for the scan and refit penalty
+    verbose     : print diagnostics
+    **kwargs    : extra args forwarded to the model-specific joint refit
+                  (e.g. penalty_cal, max_escalations for SABR)
+
+    Returns
+    -------
+    Either the original `result` (if no violation) or a new joint-refit result.
+    """
+    model = result.get("_model")
+    if model is None:
+        raise ValueError("result must contain '_model' (calibrator output).")
+
+    params   = result["params"]
+    expiries = result["expiries"]
+
+    k_grid = np.linspace(k_range[0], k_range[1], n_grid)
+    violations = []
+    worst = 0.0
+    for i in range(1, len(params)):
+        w_prev = model.w(k_grid, params[i-1])
+        w_cur  = model.w(k_grid, params[i])
+        cross  = float(np.max(w_prev - w_cur))
+        if cross > tol:
+            violations.append((i, cross))
+        worst = max(worst, cross)
+
+    if verbose:
+        print(f"\n  Calendar-arb scan over k ∈ {k_range} ({n_grid} pts), "
+              f"tol={tol:.1e}")
+        print(f"    worst crossedness across {len(params)-1} pairs: "
+              f"{worst:+.3e}")
+
+    if not violations:
+        if verbose:
+            print(f"    ✓ surface is calendar-arb-free — returning unchanged.\n")
+        return result
+
+    if verbose:
+        print(f"    ✗ {len(violations)} pair(s) violate the constraint:")
+        for i, c in violations:
+            print(f"        pair ({expiries[i-1]:.4f} → {expiries[i]:.4f}): "
+                  f"crossedness = {c:+.3e}")
+        print(f"  → joint refit with calendar enforcement\n")
+
+    obj = objective if objective is not None else result.get("objective")
+
+    name = (model.name or "").lower()
+    if name == "sabr":
+        return calibrate_global_sabr(
+            df, model=model, objective=obj,
+            warm_start=result,
+            n_cal_grid=n_grid, cal_k_range=k_range,
+            verbose=verbose, **kwargs,
+        )
+
+    if name in ("ssvi", "essvi"):
+        raise NotImplementedError(
+            f"{model.name} surfaces are made calendar-arb-free by construction "
+            f"when calibrated via calibrate_global_ssvi / calibrate_global_essvi "
+            f"(theta monotonicity). If you see violations from a per-slice fit, "
+            f"refit the surface globally instead of post-processing."
+        )
+
+    raise NotImplementedError(
+        f"enforce_calendar_arbfree does not yet support model {model.name!r}."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1225,7 +1654,8 @@ def calibrate_global_essvi_update(
             params_out.append(p)
             w_fit  = model.w(sl["k"], p)
             iv_fit = model.iv(sl["k"], p, sl["t"])
-            evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"])
+            evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"],
+                                  bid=sl.get("bid"), ask=sl.get("ask"))
             for m in DEFAULT_METRICS:
                 metrics_out[m].append(evals[m])
             if verbose:
@@ -1328,7 +1758,8 @@ def calibrate_global_essvi_update(
         params_out.append(p)
         w_fit  = model.w(sl["k"], p)
         iv_fit = model.iv(sl["k"], p, sl["t"])
-        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"])
+        evals  = evaluate_all(w_fit, sl["w"], iv_fit, sl["iv"], sl["k"], sl["t"],
+                              bid=sl.get("bid"), ask=sl.get("ask"))
         for m in DEFAULT_METRICS:
             metrics_out[m].append(evals[m])
         if verbose:
@@ -1379,10 +1810,69 @@ def summary(result: dict):
     print(f"{'─'*70}\n")
 
 
-def compare(*results) -> pd.DataFrame:
+def metric_cal_arb_violations(result: dict,
+                              k_grid: np.ndarray | None = None) -> float:
+    """
+    Fraction of (strike, expiry-pair) cells where total variance decreases
+    with maturity — i.e. calendar-arbitrage violations.
+
+    A return value of 0.0 means the surface is calendar-arb-free on the
+    sampled grid. eSSVI/SSVI typically score 0 by construction; SVI and
+    SABR can have >0 unless `enforce_arbfree=True` was used.
+    """
+    model    = result.get("_model")
+    expiries = result["expiries"]
+    params   = result["params"]
+    if model is None or len(expiries) < 2:
+        return 0.0
+    if k_grid is None:
+        k_grid = np.linspace(-0.5, 0.5, 101)
+    violations = 0
+    total      = 0
+    for i in range(len(expiries) - 1):
+        if params[i] is None or params[i + 1] is None:
+            continue
+        w_i   = model.w(k_grid, params[i])
+        w_ip1 = model.w(k_grid, params[i + 1])
+        violations += int(np.sum(w_ip1 < w_i - 1e-12))
+        total      += len(k_grid)
+    return float(violations / total) if total else 0.0
+
+
+def metric_atm_smoothness(result: dict) -> float:
+    """
+    Standard deviation of ATM-IV first differences across consecutive
+    expiries. Lower = smoother term structure. Useful for distinguishing
+    eSSVI (smooth by construction) from free-fit SVI/SABR.
+    """
+    model    = result.get("_model")
+    expiries = result["expiries"]
+    params   = result["params"]
+    if model is None or len(expiries) < 3:
+        return 0.0
+    atm = []
+    for p, t in zip(params, expiries):
+        if p is None:
+            continue
+        atm.append(float(model.iv(np.array([0.0]), p, t)[0]))
+    if len(atm) < 3:
+        return 0.0
+    return float(np.std(np.diff(atm)))
+
+
+def compare(*results, include_structural: bool = True) -> pd.DataFrame:
     """
     Compare multiple calibration results (different models or objectives)
     on the same snapshot. Returns a DataFrame of mean metrics per model.
+
+    Parameters
+    ----------
+    include_structural : bool
+        If True, also report `cal_arb_violations` (fraction of grid cells
+        with calendar arbitrage) and `atm_smoothness` (std of ATM-IV
+        first differences across expiries). These reveal what eSSVI buys
+        you over free-fit SVI/SABR — namely no arbitrage and a smoother
+        term structure — which per-slice hit-rate alone won't show.
 
     Example
     -------
@@ -1394,6 +1884,9 @@ def compare(*results) -> pd.DataFrame:
         for m, vals in r["metrics"].items():
             clean = [v for v in vals if not np.isnan(v)]
             row[m] = np.mean(clean) if clean else np.nan
+        if include_structural:
+            row["cal_arb_viol"]   = metric_cal_arb_violations(r)
+            row["atm_smoothness"] = metric_atm_smoothness(r)
         rows.append(row)
     df = pd.DataFrame(rows).set_index("model")
     print(df.to_string())

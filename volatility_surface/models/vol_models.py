@@ -304,31 +304,62 @@ class SSVI(VolModel):
 
 class SABR(VolModel):
     """
-    SABR model implied vol approximation (Hagan et al. 2002).
+    SABR model implied vol approximation.
 
-    Parameters: alpha (ATM vol level), beta (CEV exponent, typically fixed at 1
-    for lognormal), rho (spot-vol correlation), nu (vol of vol).
+    Two formulae are available, selectable at construction time:
+
+        obloj=False   →  Hagan et al. (2002)              [default]
+        obloj=True    →  Obłój  (2008)  — corrected z(K, F)
+
+    Parameters
+    ----------
+    beta  : CEV exponent (typically 1.0 for lognormal crypto SABR)
+    obloj : if True, use Obłój's corrected z(K, F) instead of Hagan's
+            geometric-mean form.
+
+    What the Obłój correction does
+    ------------------------------
+    Hagan's derivation linearises the CEV→Brownian-motion change of variable
+    using the geometric mean of F and K, giving
+
+        z_Hagan(K, F) = (ν/α) · (F·K)^((1-β)/2) · log(F/K)
+
+    Obłój pointed out that the correct expression — obtained by carrying
+    through the integral ∫_K^F dx/x^β instead of approximating it — is
+
+        z_Obłój(K, F) = (ν/α) · (F^(1-β) − K^(1-β)) / (1 − β)        (β ≠ 1)
+        z_Obłój(K, F) = (ν/α) · log(F/K)                              (β = 1)
+
+    Important: for β = 1 the two expressions coincide exactly
+    (z_Hagan reduces to (ν/α)·log(F/K) since (F·K)^0 = 1).  Setting
+    obloj=True therefore changes nothing on β=1 calibrations — the
+    correction only matters when β < 1.
+
+    The rest of the formula (A, B, C, ATM limit) is the same in both
+    forms — only the definition of z changes.
 
     Note: SABR is parameterised in implied vol space, not total variance.
     The w() method converts back to total variance for consistency with the
     rest of the framework.
-
-    For crypto options, beta=1 (lognormal SABR) is the standard choice.
     """
 
     name = "SABR"
 
-    def __init__(self, beta: float = 1.0):
+    def __init__(self, beta: float = 1.0, obloj: bool = False):
         """
         Parameters
         ----------
-        beta : float  CEV exponent, fixed before calibration (default 1.0)
+        beta  : CEV exponent, fixed before calibration (default 1.0)
+        obloj : use Obłój 2008's corrected z(K, F) instead of Hagan 2002's
+                geometric-mean form (default False).  No-op for β = 1.
         """
-        self.beta = beta
+        self.beta  = beta
+        self.obloj = bool(obloj)
 
     def _sabr_iv(self, k, params, t):
         """
-        Hagan et al. (2002) approximation for implied vol.
+        Closed-form SABR implied vol approximation.
+
         k     : log-strike (note: SABR originally uses K and F separately;
                 we reconstruct K = F*exp(k) and set F=1 by convention)
         """
@@ -343,13 +374,25 @@ class SABR(VolModel):
         eps   = 1e-7
         atm   = np.abs(k) < eps
 
-        # Mid-point for the log-expansion
         FK    = F * K
         FK_b  = FK ** ((1 - beta) / 2)
 
         log_FK = np.where(atm, 0.0, np.log(F / K))
 
-        z      = (nu / alpha) * FK_b * log_FK
+        # ── z(K, F) ──────────────────────────────────────────────────────────
+        # Hagan:  z = (ν/α) · (F·K)^((1-β)/2) · log(F/K)
+        # Obłój:  z = (ν/α) · (F^(1-β) − K^(1-β)) / (1 − β)         (β ≠ 1)
+        #         z = (ν/α) · log(F/K)                               (β = 1)
+        #
+        # For β = 1 both reduce to (ν/α)·log(F/K), so the obloj branch is a
+        # genuine change only when β < 1.
+        if self.obloj and abs(beta - 1.0) > 1e-12:
+            # (F^(1-β) − K^(1-β)) / (1 − β)  — well-defined for β ≠ 1
+            one_mb = 1.0 - beta
+            z = (nu / alpha) * (F**one_mb - K**one_mb) / one_mb
+        else:
+            z = (nu / alpha) * FK_b * log_FK
+
         safe_z = np.where(np.abs(z) < eps, 1.0, z)   # avoid 0/0 in both branches
         with np.errstate(divide="ignore", invalid="ignore"):
             x_z = np.where(
@@ -370,7 +413,8 @@ class SABR(VolModel):
         )
 
         iv = A * B * C
-        # ATM correction
+        # ATM correction — identical for Hagan and Obłój (z → 0 ⇒ x(z)/z → 1
+        # in both, so the prefactor reduces to α / F^(1-β) regardless)
         iv_atm = (
             alpha / F**(1-beta)
             * (1 + ((1-beta)**2/24 * alpha**2/F**(2*(1-beta))

@@ -1,0 +1,27 @@
+# Volatility-surface modelling — Crypto Options
+# Tested with Python 3.12 in the `natixis_internship` conda env.
+#
+#   pip install -r requirements.txt
+#
+# (or, into an explicit env)
+#   conda activate natixis_internship
+#   pip install -r requirements.txt
+
+# Scientific stack
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.17.1
+matplotlib==3.10.9
+pyarrow==24.0.0          # parquet read/write
+
+# Quant
+vollib==1.0.8            # Black / Black-Scholes IV inversion
+
+# Live pipeline + UI
+streamlit==1.58.0
+requests==2.34.2         # Deribit REST
+websocket-client==1.9.0  # Deribit ticker subscription (sync API)
+
+# Optional — only used by notebooks
+# jupyter
+# ipykernel

@@ -12,7 +12,7 @@ TARGET_COLUMNS = [
     'bid_price', 'ask_price', 'open_interest', 'mark_price', 'creation_timestamp_x', 
     'volume', 'mark_iv', 'underlying_price', 'underlying_index', 'estimated_delivery_price', 
     'mid_price', 'price_index', 'expiration_timestamp', 'strike', 'settlement_period', 
-    'option_type', 'instrument_id'
+    'option_type', 'instrument_id', 'bid_size', 'ask_size'
 ]
 
 def get_index_price(index_name: str = 'eth_usd') -> Optional[float]:
@@ -118,7 +118,7 @@ def save_to_csv(df: pd.DataFrame) -> None:
     filename = f"eth_{timestamp}.csv"
     
     # Save to the current directory (or change to 'data/' if needed)
-    path = r'/Users/macbookair/Internship Natixis/2 - Data/eth/'
+    path = r'/Users/macbookair/Internship Natixis/2 - Data/market_making/'
     df.to_csv(path+filename, index=False)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Saved data to {filename}")
 

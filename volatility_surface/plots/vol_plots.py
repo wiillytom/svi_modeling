@@ -19,8 +19,10 @@ Functions
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.dates as mdates
 from matplotlib.cm import ScalarMappable
 from scipy.interpolate import PchipInterpolator
+from datetime import datetime
 
 from volatility_surface.models.vol_models import VolModel, get_model
 
@@ -398,3 +400,157 @@ def plot_all(result: dict, df=None, save_prefix: str = None):
             print(f"Saved {path}")
 
     return tuple(figs.values())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# METRIC TIME-SERIES  (comparison dict → one line per model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Metrics where values are already in [0,1] and should be displayed as %
+_PCT_METRICS = {"spread_hit_rate"}
+
+# Metrics that are "lower is better" (affects nothing visually but useful to know)
+_LOWER_IS_BETTER = {
+    "vwrmse", "vwrrmse", "iv_rmse", "iv_rrmse", "w_rmse",
+    "price_rmse", "price_rrmse", "price_vwrrmse", "max_iv_err",
+    "iv_rmse_atm", "iv_rmse_otm",
+}
+
+_METRIC_YLABELS = {
+    "spread_hit_rate": "Spread Hit Rate",
+    "vwrmse":          "VW-RMSE  (vol, absolute)",
+    "vwrrmse":         "VW-RRMSE  (vol, relative)",
+    "iv_rrmse":        "IV Relative RMSE",
+    "iv_rmse":         "IV RMSE  (vol pts)",
+    "w_rmse":          "Total-Var RMSE",
+    "price_rmse":      "Price RMSE",
+    "price_rrmse":     "Price Relative RMSE",
+    "price_vwrrmse":   "Price VW-RRMSE",
+    "max_iv_err":      "Max IV Error  (vol pts)",
+    "iv_rmse_atm":     "ATM IV RMSE  (vol pts)",
+    "iv_rmse_otm":     "OTM IV RMSE  (vol pts)",
+}
+
+
+def plot_metric_by_date(
+    comparison_dict,
+    metric:      str   = "spread_hit_rate",
+    models:      list  = None,
+    colors:      dict  = None,
+    markers:     dict  = None,
+    title:       str   = None,
+    subtitle:    str   = None,
+    pct_format:  bool  = None,
+    scale:       float = 1.0,
+    figsize:     tuple = (12, 7),
+    savepath:    str   = None,
+    annotate:    bool  = True,
+) -> plt.Figure:
+    """
+    Plot any scalar metric from a comparison dict over time.
+
+    Parameters
+    ----------
+    comparison_dict : dict  {date_str → object with attributes = metric names}
+        e.g. comparison_dict['2026-05-22'].vwrmse == {'Raw SVI': 0.01, ...}
+    metric      : attribute name on the comparison objects, e.g. 'vwrmse',
+                  'spread_hit_rate', 'iv_rrmse', 'price_vwrrmse', …
+    models      : list of model names to plot.  Default: all keys in the first entry.
+    colors      : dict {model: hex color}.  Default palette used if not given.
+    markers     : dict {model: marker char}.
+    title       : plot title.  Default: '<metric> by Model & Date'.
+    subtitle    : small text below title.  Default: none.
+    pct_format  : True = format y-axis as %; False = raw float; None = auto-detect.
+    scale       : multiply all values by this before plotting (e.g. 100 to convert
+                  decimal vol to %).  Default 1.0.
+    figsize     : figure size.
+    savepath    : if given, save PNG to this path.
+    annotate    : if True, label each data point with its value.
+
+    Returns
+    -------
+    matplotlib Figure
+    """
+    dates    = sorted(comparison_dict.keys())
+    dates_dt = [datetime.strptime(d, '%Y-%m-%d') for d in dates]
+
+    # Infer models from the first entry if not specified
+    if models is None:
+        first = getattr(next(iter(comparison_dict.values())), metric, None)
+        if first is None:
+            raise ValueError(f"Metric '{metric}' not found on comparison objects.")
+        models = list(first.keys())
+
+    # Default style
+    default_colors  = ['#4C9BE8', '#E8814C', '#4CE882', '#9B59B6',
+                       '#E74C3C', '#1ABC9C', '#F39C12', '#2ECC71']
+    default_markers = ['o', 's', '^', 'D', 'v', 'P', 'X', 'h']
+    colors  = colors  or {m: default_colors[i % len(default_colors)]
+                          for i, m in enumerate(models)}
+    markers = markers or {m: default_markers[i % len(default_markers)]
+                          for i, m in enumerate(models)}
+
+    # Gather values
+    values = {m: [] for m in models}
+    for date in dates:
+        entry = getattr(comparison_dict[date], metric, {})
+        for m in models:
+            values[m].append(entry.get(m, float('nan')) * scale)
+
+    # Auto-detect % formatting
+    if pct_format is None:
+        pct_format = (metric in _PCT_METRICS) and (scale == 1.0)
+
+    # Titles
+    if title is None:
+        title = f"{metric.replace('_', ' ').upper()} by Model & Date"
+
+    ylabel = _METRIC_YLABELS.get(metric, metric)
+    if scale != 1.0:
+        ylabel += f"  (×{scale})"
+
+    # ── Plot ─────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for model in models:
+        ax.plot(
+            dates_dt, values[model],
+            label=model,
+            color=colors[model],
+            marker=markers[model],
+            linewidth=2, markersize=7,
+            markeredgewidth=1.2, markeredgecolor='white',
+        )
+        if annotate:
+            for x, y in zip(dates_dt, values[model]):
+                if np.isfinite(y):
+                    label = f'{y:.0%}' if pct_format else f'{y:.4f}'
+                    ax.annotate(label, xy=(x, y),
+                                xytext=(0, 10), textcoords='offset points',
+                                ha='center', fontsize=7.5, color=colors[model])
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    ax.xaxis.set_major_locator(mdates.DayLocator())
+    plt.xticks(dates_dt, rotation=35, ha='right', fontsize=9)
+
+    if pct_format:
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0%}'))
+    ax.set_xlabel('Date', fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_title(title, fontsize=14, fontweight='bold',
+                 pad=26 if subtitle else 14)
+    if subtitle:
+        ax.text(0.5, 1.02, subtitle, transform=ax.transAxes,
+                ha='center', va='bottom', fontsize=10, color='gray')
+
+    ax.legend(fontsize=10, framealpha=0.85)
+    ax.grid(axis='y', linestyle='--', alpha=0.4)
+    ax.grid(axis='x', linestyle=':', alpha=0.25)
+    plt.tight_layout()
+
+    if savepath:
+        fig.savefig(savepath, dpi=150, bbox_inches='tight')
+        print(f"Saved → {savepath}")
+
+    plt.show()
+    return fig

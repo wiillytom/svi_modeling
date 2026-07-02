@@ -35,24 +35,48 @@ only via the parquet file (atomic rename, safe to read concurrently).
 
 ## File map
 
-### `volatility_surface/`
+### `volatility_surface/core/` — calibration & pricing
 
 | file | role |
 |---|---|
+| `calibration/calibrator.py` | All `calibrate_*` functions (per-slice SVI, global eSSVI/SSVI, SABR, theta-only update) |
+| `calibration/objectives.py` | Objective function registry (`iv_wmse`, `vega_wmse`, `iv_zweighted`, `band`, …) |
+| `pricing/pricing_models.py` | Black-Scholes / Garman-Kohlhagen pricing |
+| `pricing/volatility_dataframe.py` | Row-wise IV inversion via `vollib` |
+
+### `volatility_surface/models/` — volatility models
+
+| file | role |
+|---|---|
+| `vol_models.py` | Model classes: `RawSVI`, `SSVI`, `eSSVI`, `SABR` |
+| `rw_parabolic.py` | Reiswich-Wystup simplified parabolic (delta-space) |
+
+### `volatility_surface/utils/` — data, live pipeline & apps
+
+| file | role |
+|---|---|
+| `data_handling.py` | Offline cleaning: CSV → cleaned parquet |
+| `option_data_gathering.py` | Deribit REST helpers (`get_book_summary`, `get_index_price`) |
+| `arbitrage_checker.py` | Static-arbitrage detection and heatmap plotting |
 | `live_gather.py` | Live Deribit poller. REST for book summary + WS for sizes + rolling parquet writer |
 | `streamlit_chain.py` | Live option-chain trading screen, eSSVI fast-path refits, maturity tabs |
 | `streamlit_svi.py` | Interactive SVI / SVI-JW explorer with risk-neutral density |
 | `benchmark_objectives.py` | Sweep of 10 fitting objectives on global eSSVI across snapshots → plot |
-| `core/calibration/calibrator.py` | All `calibrate_*` functions (per-slice SVI, global eSSVI/SSVI, SABR, theta-only update) |
-| `core/calibration/objectives.py` | Objective function registry (`iv_wmse`, `vega_wmse`, `iv_zweighted`, `band`, …) |
-| `core/pricing/pricing_models.py` | Black-Scholes / Garman-Kohlhagen pricing |
-| `core/pricing/volatility_dataframe.py` | Row-wise IV inversion via `vollib` |
-| `models/vol_models.py` | Model classes: `RawSVI`, `SSVI`, `eSSVI`, `SABR` |
-| `plots/vol_plots.py` | Calibration plots: smile / surface / metrics |
-| `utils/data_handling.py` | Offline cleaning: CSV → cleaned parquet |
-| `utils/option_data_gathering.py` | Original Deribit REST helpers (`get_book_summary`, `get_index_price`) |
-| `notebooks/notebook.ipynb` | Main research notebook |
-| `notebooks/results.ipynb` | Result inspection / plots |
+| `benchmark_rw_parabolic.py` | RW parabolic vs {SVI, SSVI, eSSVI, SABR} benchmark |
+
+### `volatility_surface/plots/`
+
+| file | role |
+|---|---|
+| `vol_plots.py` | Calibration plots: smile / surface / metrics |
+
+### `volatility_surface/notebooks/`
+
+| file | role |
+|---|---|
+| `project_outline.ipynb` | Start-to-finish walkthrough (run this first) |
+| `notebook.ipynb` | Main research notebook |
+| `results.ipynb` | Result inspection / plots |
 
 ### Top-level
 
@@ -159,7 +183,8 @@ REST + WS feeds.
 | **SABR** | `α, ρ, ν` (β fixed) | – | classical Hagan; optional Obłój correction for β<1 |
 
 Calibration data convention: bid/ask columns are **`bid_iv`** and **`ask_iv`**
-(not `bid`/`ask`). The gatherer fills `vega` analytically from `mark_iv`.
+(not `bid`/`ask`). Greeks (vega, delta, gamma, theta) are pulled directly
+from the Deribit API.
 
 ---
 

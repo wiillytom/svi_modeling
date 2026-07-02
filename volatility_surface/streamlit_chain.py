@@ -17,7 +17,17 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _find_project_root(start: Path) -> Path:
+    """Walk upward from `start` until we hit the folder that contains
+    the '2 - Data' data directory. Robust to how deeply the streamlit
+    script is nested inside the code tree."""
+    here = start.resolve()
+    for candidate in [here, *here.parents]:
+        if (candidate / "2 - Data").is_dir():
+            return candidate
+    return here.parent.parent   # fall back to the old assumption
+
+PROJECT_ROOT = _find_project_root(Path(__file__))
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -44,6 +54,12 @@ PURPLE  = "#6A0DAD"
 
 def _live_parquet_for(ccy: str) -> Path:
     return LIVE_DIR / f"live_{ccy}.parquet"
+
+
+def _replay_parquet_for(ccy: str) -> Path:
+    """Pre-recorded snapshot file used in replay mode.
+    Put your file at 2 - Data/live/replay_<ccy>.parquet."""
+    return LIVE_DIR / f"replay_{ccy}.parquet"
 
 
 def _archive_parquet_for(ccy: str) -> Path:
@@ -94,7 +110,16 @@ def bs_pricing(F, K, T, iv, is_call):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _which_parquet(ccy: str) -> Path:
-    """Prefer the live parquet; fall back to the cleaned archive."""
+    """
+    Source-file priority:
+      1. replay parquet   — if the user is in replay mode AND the file exists
+      2. live parquet     — normal "gatherer is running" case
+      3. archive parquet  — historical fallback
+    """
+    if st.session_state.get("replay_mode", False):
+        rep = _replay_parquet_for(ccy)
+        if rep.exists():
+            return rep
     live = _live_parquet_for(ccy)
     if live.exists():
         return live
@@ -107,16 +132,38 @@ def _latest_timestamp(ccy: str) -> str:
     return str(df["file_timestamp"].max())
 
 
-def _load_latest_snapshot(ccy: str) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def _sorted_timestamps(ccy: str, mtime: float) -> list:
+    """All distinct file_timestamps in the parquet, in chronological order.
+    `mtime` is only passed so the cache invalidates when the file changes."""
+    p = _which_parquet(ccy)
+    df = pd.read_parquet(p, columns=["file_timestamp"])
+    return sorted(df["file_timestamp"].unique().tolist())
+
+
+def _load_snapshot_at(ccy: str, index: int | None = None) -> pd.DataFrame:
+    """Load the snapshot at position `index` in chronological order (0-based).
+    If `index` is None, returns the latest — the original behaviour."""
     p = _which_parquet(ccy)
     df = pd.read_parquet(p)
-    latest = df["file_timestamp"].max()
-    snap = df[df["file_timestamp"] == latest].copy()
+    if index is None:
+        target_ts = df["file_timestamp"].max()
+    else:
+        ts_list = _sorted_timestamps(ccy, p.stat().st_mtime)
+        target_ts = ts_list[index % len(ts_list)]     # loop at end
+    snap = df[df["file_timestamp"] == target_ts].copy()
     snap["t"] = snap["t"].round(4)
     snap = snap[(snap["t"] > 1e-5) & (snap["mark_iv"] > 1e-4)
                 & (snap["mark_iv"] < 5.0) & (snap["w"] > 0)]
-    snap = snap.dropna(subset=["k", "w", "t", "mark_iv"]).reset_index(drop=True)
-    return snap
+    return snap.dropna(subset=["k", "w", "t", "mark_iv"]).reset_index(drop=True)
+
+
+def _load_latest_snapshot(ccy: str) -> pd.DataFrame:
+    """Compat shim: honours session-state replay-mode toggle."""
+    if st.session_state.get("replay_mode", False):
+        idx = st.session_state.get("replay_idx", 0)
+        return _load_snapshot_at(ccy, idx)
+    return _load_snapshot_at(ccy, None)
 
 
 @st.cache_resource(show_spinner=True)
@@ -219,9 +266,38 @@ ccy = st.sidebar.selectbox(
 model_name = st.sidebar.selectbox("Model", options=MODELS, index=0)
 
 source_path = _which_parquet(ccy)
-is_live = source_path == _live_parquet_for(ccy)
-src_label = "🟢 live"  if is_live else "📦 archive"
+if source_path == _replay_parquet_for(ccy):
+    src_label = "🔁 replay"
+elif source_path == _live_parquet_for(ccy):
+    src_label = "🟢 live"
+else:
+    src_label = "📦 archive"
 st.sidebar.markdown(f"**Source**: {src_label}  \n`{source_path.name}`")
+
+# ── Replay mode: step through a pre-recorded parquet as if live ──────────────
+# Use case: work machine has no Deribit access.  Record N seconds of the live
+# parquet at home, ship it to the work machine, then flip this toggle to have
+# the app iterate through timestamps one per tick instead of pinning "latest".
+replay_mode = st.sidebar.checkbox(
+    "Replay mode",
+    value=False,
+    help="Iterate through every timestamp in the parquet one per tick "
+         "(loops at the end). Off = pin to latest, the normal live behaviour."
+)
+st.session_state["replay_mode"] = replay_mode
+if replay_mode:
+    _ts_list = _sorted_timestamps(ccy, source_path.stat().st_mtime)
+    st.sidebar.caption(
+        f"Replay: {len(_ts_list)} snapshots  "
+        f"(from `{_ts_list[0]}` to `{_ts_list[-1]}`)"
+    )
+    _idx = st.session_state.get("replay_idx", 0)
+    st.sidebar.progress(
+        (_idx % len(_ts_list)) / max(len(_ts_list) - 1, 1),
+        text=f"snapshot {(_idx % len(_ts_list)) + 1} / {len(_ts_list)}"
+    )
+    if st.sidebar.button("↺ Restart replay from t=0"):
+        st.session_state["replay_idx"] = 0
 
 # Per-(ccy, model) state — cached fits + warm-start anchors live independently
 if "refit_tokens"  not in st.session_state: st.session_state.refit_tokens = {}
@@ -668,10 +744,17 @@ def _render_tab(tb, df, res, exp_arr, ts, age, fit_ms, frame_idx):
 # Main loop — re-reads the live parquet on every tick
 # ─────────────────────────────────────────────────────────────────────────────
 
-if not live:
+if not live and not st.session_state.get("replay_mode", False):
     render_frame(frame_idx=0)
 else:
+    # Replay mode reuses the same tick loop as live mode — each tick the
+    # replay cursor advances by one, and _load_latest_snapshot picks the
+    # snapshot at that index instead of the latest.
+    if "replay_idx" not in st.session_state:
+        st.session_state["replay_idx"] = 0
     while True:
         st.session_state.iter += 1
+        if st.session_state.get("replay_mode", False):
+            st.session_state["replay_idx"] += 1
         render_frame(frame_idx=st.session_state.iter)
         time.sleep(tick_ms / 1000.0)

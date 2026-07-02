@@ -13,8 +13,12 @@ set -euo pipefail
 WHICH="${1:-both}"
 POLL="${2:-1}"
 
-ENV_PY=/opt/anaconda3/envs/natixis_internship/bin/python
-ENV_ST=/opt/anaconda3/envs/natixis_internship/bin/streamlit
+# Use whatever python/streamlit are on PATH — activate the intended conda env
+# BEFORE running this script:
+#     conda activate natixis_internship
+# Override by exporting ENV_PY / ENV_ST if you need explicit paths.
+ENV_PY="${ENV_PY:-python}"
+ENV_ST="${ENV_ST:-streamlit}"
 
 cd "$(dirname "$0")"
 mkdir -p "2 - Data/live"

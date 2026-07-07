@@ -125,9 +125,9 @@ only via the parquet file (atomic rename, safe to read concurrently).
 ### Objective benchmark
 
 ```bash
-python volatility_surface/benchmark_objectives.py            # all 15 snapshots
-python volatility_surface/benchmark_objectives.py --quick    # first 4 expiries each
-python volatility_surface/benchmark_objectives.py --random 10 --seed 42
+python volatility_surface/utils/benchmark_objectives.py            # all 15 snapshots
+python volatility_surface/utils/benchmark_objectives.py --quick    # first 4 expiries each
+python volatility_surface/utils/benchmark_objectives.py --random 10 --seed 42
 ```
 
 Outputs `benchmark_objectives_essvi.pkl` (raw per-slice metrics) and
@@ -137,7 +137,7 @@ scatter).
 ### Static SVI explorer
 
 ```bash
-streamlit run volatility_surface/streamlit_svi.py
+streamlit run volatility_surface/utils/streamlit_svi.py
 ```
 
 Interactive sliders for Raw SVI (`a, b, ρ, m, σ`) and SVI Jump-Wings

@@ -208,40 +208,89 @@ class RawSVI(VolModel):
 
 class SSVI(VolModel):
     """
-    Surface SVI with power-law phi(theta) = eta / theta^gamma.
+    Surface SVI with a pluggable phi(theta) parametrization.
 
-    Per-slice parameters: theta (ATM total variance), eta, rho, gamma.
-    Free of static arbitrage when  eta*(1+|rho|) <= 2  and  gamma in (0, 0.5].
+    phi_type = "power"  (default): phi(theta) = eta / theta^gamma
+               Gatheral-Jacquier (2012) power-law form.
+    phi_type = "heston"           : phi(theta) = (1/(lam*theta)) *
+               (1 - (1 - exp(-lam*theta)) / (lam*theta))
+               The other original Gatheral-Jacquier form, motivated by the
+               short/long-maturity smile behaviour implied by Heston.
+               Single shape parameter lam (no eta/gamma).
+    phi_type = "blend"            : phi(theta) = eta / (theta^gamma * (1+theta)^(1-gamma))
+               Blended power-law that interpolates the effective decay
+               exponent between small and large theta, from later eSSVI
+               calibration-robustness literature.
 
-    In per-slice mode (default), eta, rho, gamma are fitted per expiry.
-    For a truly global SSVI fit use SSVIGlobal below.
+    Per-slice parameters: theta (ATM total variance), rho, plus the
+    phi-specific shape parameters — (eta, gamma) for "power"/"blend",
+    (lam) for "heston".
+
+    "power"/"blend" are free of static arbitrage when eta*(1+|rho|) <= 2
+    and gamma in (0, 0.5] (Gatheral-Jacquier 2012). The Heston-like form's
+    own arbitrage condition differs (ibid., Remark 4.3); it is checked here
+    via the same analytical single-slice min_g scan rather than a closed-form
+    bound, consistent with how butterfly arbitrage is checked elsewhere in
+    this codebase.
+
+    In per-slice mode (default), all shape params are fitted per expiry.
+    For a truly global SSVI fit use calibrate_global_ssvi.
     """
 
     name = "SSVI"
 
+    def __init__(self, phi_type: str = "power"):
+        if phi_type not in ("power", "heston", "blend"):
+            raise ValueError(f"Unknown phi_type '{phi_type}'. Use 'power', 'heston', or 'blend'.")
+        self.phi_type = phi_type
+
+    def _phi(self, theta, params):
+        if self.phi_type == "heston":
+            lam = params["lam"]
+            x = lam * theta
+            return (1.0 / x) * (1.0 - (1.0 - np.exp(-x)) / x)
+        eta, gamma = params["eta"], params["gamma"]
+        if self.phi_type == "blend":
+            return eta / (theta ** gamma * (1.0 + theta) ** (1.0 - gamma))
+        return eta / (theta ** gamma)   # "power"
+
     def w(self, k, params):
         k     = np.asarray(k, dtype=float)
         theta = params["theta"]
-        eta   = params["eta"]
         rho   = params["rho"]
-        gamma = params["gamma"]
-        phi   = eta / (theta ** gamma)
+        phi   = self._phi(theta, params)
         return (theta / 2) * (
             1 + rho * phi * k + np.sqrt((phi * k + rho)**2 + 1 - rho**2)
         )
 
     def validate(self, params):
-        eta, rho, gamma = params["eta"], params["rho"], params["gamma"]
-        theta = params["theta"]
-        return (
-            eta > 0
-            and abs(rho) < 1
-            and 0 < gamma <= 0.5
-            and theta > 0
-            and eta * (1 + abs(rho)) <= 2
-        )
+        rho, theta = params["rho"], params["theta"]
+        if not (theta > 0 and abs(rho) < 1):
+            return False
+        if self.phi_type == "heston":
+            return params["lam"] > 0
+        eta, gamma = params["eta"], params["gamma"]
+        if not (eta > 0 and 0 < gamma <= 0.5):
+            return False
+        if self.phi_type == "blend":
+            # eta*(1+|rho|)<=2 is the plain power-law's condition (Gatheral-
+            # Jacquier 2012, sup at theta->infinity for gamma=1/2) — it does
+            # NOT hold for this phi. Re-deriving Theorem 4.2 condition (iii)
+            # for phi(theta) = eta/(theta^gamma (1+theta)^(1-gamma)) at
+            # gamma=1/2 gives theta*phi(theta)^2 = eta^2/(1+theta), whose sup
+            # is at theta->0, i.e. eta^2*(1+|rho|) <= 4 (== eta(1+|rho|)<=2
+            # only when rho=0). No clean closed form is derived here for
+            # gamma != 0.5, so fall back to the exact numerical check.
+            return self.min_g(params) >= -1e-9
+        return eta * (1 + abs(rho)) <= 2
 
     def pack(self, params):
+        if self.phi_type == "heston":
+            return np.array([
+                np.log(max(params["theta"], 1e-9)),
+                np.arctanh(np.clip(params["rho"], -0.9999, 0.9999)),
+                np.log(max(params["lam"], 1e-9)),
+            ])
         return np.array([
             np.log(max(params["theta"], 1e-9)),
             np.log(max(params["eta"],   1e-9)),
@@ -250,6 +299,12 @@ class SSVI(VolModel):
         ])
 
     def unpack(self, x):
+        if self.phi_type == "heston":
+            return {
+                "theta": float(np.exp(x[0])),
+                "rho":   float(np.tanh(x[1])),
+                "lam":   float(np.exp(x[2])),
+            }
         gamma_raw = np.exp(x[3])
         gamma     = 0.5 * gamma_raw / (1 + gamma_raw)   # maps R -> (0, 0.5)
         return {
@@ -260,6 +315,12 @@ class SSVI(VolModel):
         }
 
     def bounds(self):
+        if self.phi_type == "heston":
+            return [
+                (np.log(1e-5), np.log(5.0)),   # log theta
+                (-3.5, 3.5),                    # arctanh rho
+                (np.log(1e-2), np.log(50.0)),   # log lam
+            ]
         return [
             (np.log(1e-5), np.log(5.0)),   # log theta
             (np.log(1e-3), np.log(10.0)),  # log eta
@@ -269,6 +330,8 @@ class SSVI(VolModel):
 
     def initial_guess(self, k, w_obs, t):
         atm_w = float(np.interp(0.0, np.sort(k), w_obs[np.argsort(k)]))
+        if self.phi_type == "heston":
+            return {"theta": atm_w, "rho": -0.7, "lam": 2.0}
         return {"theta": atm_w, "eta": 2.0, "rho": -0.7, "gamma": 0.4}
 
     def min_g(self, params, k_range=(-4.0, 4.0), n=50):
@@ -279,7 +342,8 @@ class SSVI(VolModel):
         the first and second derivatives are exact:
             dw/dk  = (theta*phi/2) * (rho + (phi*k+rho)/D)
             d²w/dk² = (theta*phi²/2) * (1-rho²) / D³
-        where D = sqrt((phi*k+rho)² + 1-rho²).
+        where D = sqrt((phi*k+rho)² + 1-rho²).  This holds for any phi_type
+        since phi enters only as a scalar (function of theta, not k) here.
 
         Evaluates g(k) on 50 points — ~15× faster than the base-class
         600-point finite-difference scan, and checks the actual single-slice
@@ -287,8 +351,8 @@ class SSVI(VolModel):
         """
         k     = np.linspace(k_range[0], k_range[1], n)
         theta = params["theta"]
-        phi   = params["eta"] / (theta ** params["gamma"])
         rho   = params["rho"]
+        phi   = self._phi(theta, params)
         P     = phi * k + rho
         D     = np.sqrt(np.maximum(P**2 + (1 - rho**2), 1e-10))
         W     = np.maximum((theta / 2) * (1 + rho * phi * k + D), 1e-10)

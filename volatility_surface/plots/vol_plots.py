@@ -13,6 +13,7 @@ Functions
     plot_total_variance(result)     Gatheral-style total variance overlay
     plot_metrics(result)            Bar chart of per-slice fit metrics
     plot_compare(results, df)       Overlay multiple model fits on one slice
+    plot_rho_comparison(res_ssvi, res_essvi)  SSVI (const) vs eSSVI rho(theta)
     plot_all(result, df)            Generate all plots at once
 """
 
@@ -23,8 +24,35 @@ import matplotlib.dates as mdates
 from matplotlib.cm import ScalarMappable
 from scipy.interpolate import PchipInterpolator
 from datetime import datetime
+import seaborn as sns
 
 from volatility_surface.models.vol_models import VolModel, get_model
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL PALETTE — RdPu
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CMAP_FULL = plt.get_cmap("RdPu")
+CMAP = mcolors.LinearSegmentedColormap.from_list(
+    "RdPu_trimmed",
+    [_CMAP_FULL(x) for x in np.linspace(0.25, 1.0, 256)],
+)
+PALETTE = [CMAP(x) for x in np.linspace(0.0, 1.0, 8)]
+PALETTE_HEX = [mcolors.to_hex(c) for c in PALETTE]
+
+BG_COLOR     = "#ffffff"
+FIT_COLOR    = PALETTE[4]       # mid-dark purple-pink for fitted curves
+RND_OK_COLOR = PALETTE[1]       # light pink for well-behaved RND
+RND_ARB_COLOR = PALETTE[7]      # deep magenta for butterfly-arb RND
+BID_COLOR    = PALETTE[2]       # market bid scatter
+ASK_COLOR    = PALETTE[6]       # market ask scatter
+
+
+def _n_colors(n: int):
+    """Sample `n` evenly spaced colours from the RdPu colourmap (skip the
+    near-white bottom end)."""
+    return [CMAP(x) for x in np.linspace(0.25, 0.95, n)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,10 +78,10 @@ def _scatter_market(ax, df_slice, t):
         return
     if "bid_iv" in df_slice.columns and "ask_iv" in df_slice.columns:
         ax.scatter(df_slice["k"], df_slice["bid_iv"] * 100,
-                   color="#e05252", s=12, alpha=0.7, marker="x",
+                   color=BID_COLOR, s=12, alpha=0.7, marker="x",
                    label="Bid", zorder=4)
         ax.scatter(df_slice["k"], df_slice["ask_iv"] * 100,
-                   color="#5288e0", s=12, alpha=0.7, marker="x",
+                   color=ASK_COLOR, s=12, alpha=0.7, marker="x",
                    label="Ask", zorder=4)
     elif "mark_iv" in df_slice.columns:
         ax.scatter(df_slice["k"], df_slice['mark_iv'] * 100,
@@ -66,8 +94,10 @@ def _scatter_market(ax, df_slice, t):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_surface(result: dict, k_range=(-2.0, 2.0), n_k=200, n_t=100,
-                 colormap="plasma", figsize=(12, 7)) -> plt.Figure:
+                 colormap=None, figsize=(12, 7)) -> plt.Figure:
     """3D implied volatility surface across all fitted expiries."""
+    if colormap is None:
+        colormap = CMAP
     model      = _get_model(result)
     expiries   = np.array(result["expiries"])
     params_list = result["params"]
@@ -84,8 +114,8 @@ def plot_surface(result: dict, k_range=(-2.0, 2.0), n_k=200, n_t=100,
 
     T_mesh, K_mesh = np.meshgrid(t_grid, k_grid, indexing="ij")
 
-    fig = plt.figure(figsize=figsize, facecolor="white")
-    ax  = fig.add_subplot(111, projection="3d", facecolor="white")
+    fig = plt.figure(figsize=figsize, facecolor=BG_COLOR)
+    ax  = fig.add_subplot(111, projection="3d", facecolor=BG_COLOR)
 
     surf = ax.plot_surface(K_mesh, T_mesh, iv_surface, cmap=colormap,
                            linewidth=0, antialiased=True, alpha=0.92,
@@ -106,7 +136,8 @@ def plot_surface(result: dict, k_range=(-2.0, 2.0), n_k=200, n_t=100,
                  color="black", fontsize=12, pad=14)
 
     for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
-        pane.fill = False
+        pane.fill = True
+        pane.set_facecolor(BG_COLOR)
         pane.set_edgecolor("#333333")
     ax.tick_params(colors="black")
     fig.tight_layout()
@@ -131,8 +162,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
     if figsize is None:
         figsize = (5.5 * n_cols, 4.2 * n_rows)
 
-    fig    = plt.figure(figsize=figsize, facecolor="#ffffff")
-    colors = [0.994324, 0.716681, 0.177208, 1.      ]#plt.cm.plasma(np.linspace(0.5, 1.25, n_slices))
+    fig    = plt.figure(figsize=figsize, facecolor=BG_COLOR)
 
     for idx, (t_exp, p) in enumerate(zip(expiries, params_list)):
         ax_iv  = fig.add_subplot(n_rows, n_cols, idx + 1)
@@ -144,7 +174,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
 
         # Fitted smile
         iv_fit  = model.iv(k_grid, p, t_exp)
-        ax_iv.plot(k_grid, iv_fit * 100, color=colors, lw=2.0,
+        ax_iv.plot(k_grid, iv_fit * 100, color=FIT_COLOR, lw=2.0,
                    label=f"{model.name} fit", zorder=3)
 
         # Market observations
@@ -153,7 +183,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
         # RND
         rnd       = model.butterfly_density(k_grid, p)
         has_neg   = model.has_butterfly_arb(p)
-        rnd_color = "#ff6b35" if has_neg else "#fbfffb"#"#7ecf7e"
+        rnd_color = RND_ARB_COLOR if has_neg else RND_OK_COLOR
         ax_rnd.fill_between(k_grid, rnd, alpha=0.22, color=rnd_color, zorder=1)
         ax_rnd.plot(k_grid, rnd, color=rnd_color, lw=1.0, alpha=0.7,
                     label="RND", zorder=2)
@@ -167,12 +197,12 @@ def plot_slices(result: dict, df=None, n_cols=3,
 
         ax_iv.set_title(title_str, color="black", fontsize=8.5, pad=5)
         ax_iv.set_xlabel("Log-strike  k", color="#111111", fontsize=7.5)
-        ax_iv.set_ylabel("Impl. Vol (%)", color=colors, fontsize=7.5)
+        ax_iv.set_ylabel("Impl. Vol (%)", color=FIT_COLOR, fontsize=7.5)
         ax_rnd.set_ylabel("RND", color=rnd_color, fontsize=7.5)
         ax_iv.tick_params(colors="#111111", labelsize=7)
-        ax_iv.tick_params(axis="y", colors=colors)
+        ax_iv.tick_params(axis="y", colors=FIT_COLOR)
         ax_rnd.tick_params(colors=rnd_color, labelsize=7)
-        ax_iv.set_facecolor("#ffffff")
+        ax_iv.set_facecolor(BG_COLOR)
         for spine in list(ax_iv.spines.values()) + list(ax_rnd.spines.values()):
             spine.set_edgecolor("#333333")
 
@@ -181,7 +211,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
                      + ax_rnd.get_legend_handles_labels()[0])
             labels = (ax_iv.get_legend_handles_labels()[1]
                       + ax_rnd.get_legend_handles_labels()[1])
-            ax_iv.legend(lines, labels, fontsize=6.5, facecolor="#ffffff",
+            ax_iv.legend(lines, labels, fontsize=6.5, facecolor=BG_COLOR,
                          edgecolor="#444444", labelcolor="black", loc="upper right")
 
     # Hide unused axes
@@ -190,7 +220,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
 
     fig.suptitle(f"{result['model_name']} — Smile & Risk-Neutral Density",
                  color="black", fontsize=12, y=1.01)
-    fig.patch.set_facecolor("#ffffff")
+    fig.patch.set_facecolor(BG_COLOR)
     fig.tight_layout()
     return fig
 
@@ -200,7 +230,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_total_variance(result: dict, k_range=(-2.0, 2.0), n_grid=400,
-                        figsize=(10, 5), cmap="rainbow",
+                        figsize=(10, 5), cmap=None,
                         n_cbar_ticks=8) -> plt.Figure:
     """
     Gatheral-style total variance plot.
@@ -212,12 +242,12 @@ def plot_total_variance(result: dict, k_range=(-2.0, 2.0), n_grid=400,
     params_list = result["params"]
 
     k_grid   = np.linspace(k_range[0], k_range[1], n_grid)
-    colormap = plt.get_cmap(cmap)
+    colormap = CMAP if cmap is None else plt.get_cmap(cmap)
     t_min, t_max = expiries.min(), expiries.max()
     norm = mcolors.Normalize(vmin=t_min, vmax=t_max)
 
-    fig, ax = plt.subplots(figsize=figsize, facecolor="#ffffff")
-    ax.set_facecolor("#ffffff")
+    fig, ax = plt.subplots(figsize=figsize, facecolor=BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
 
     for t_exp, p in zip(expiries, params_list):
         color = colormap(norm(t_exp))
@@ -264,18 +294,18 @@ def plot_metrics(result: dict, figsize=None) -> plt.Figure:
     if figsize is None:
         figsize = (5 * n_metrics, 4)
 
-    fig, axes = plt.subplots(1, n_metrics, figsize=figsize, facecolor="#ffffff")
+    fig, axes = plt.subplots(1, n_metrics, figsize=figsize, facecolor=BG_COLOR)
     if n_metrics == 1:
         axes = [axes]
 
-    colors = plt.cm.plasma(np.linspace(0.15, 0.85, len(expiries)))
+    colors = _n_colors(len(expiries))
     x      = np.arange(len(expiries))
     labels = [f"{t:.3f}" for t in expiries]
 
     for ax, metric in zip(axes, metric_names):
         vals = metrics_dict[metric]
         bars = ax.bar(x, vals, color=colors, edgecolor="#333333", linewidth=0.5)
-        ax.set_facecolor("#ffffff")
+        ax.set_facecolor(BG_COLOR)
         ax.set_title(metric, color="black", fontsize=9)
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=45, ha="right",
@@ -292,7 +322,7 @@ def plot_metrics(result: dict, figsize=None) -> plt.Figure:
 
     fig.suptitle(f"{result['model_name']} — Fit Metrics by Expiry",
                  color="black", fontsize=11, y=1.02)
-    fig.patch.set_facecolor("#ffffff")
+    fig.patch.set_facecolor(BG_COLOR)
     fig.tight_layout()
     return fig
 
@@ -324,12 +354,12 @@ def plot_compare(results: list, df=None, t_exp: float = None,
     k_lo, k_hi = _k_range(df_slice, global_range=k_plot_range)
     k_grid  = np.linspace(k_lo, k_hi, n_grid)
 
-    colors = plt.cm.tab10(np.linspace(0, 0.9, len(results)))
+    colors = _n_colors(len(results))
 
     fig, (ax_iv, ax_rnd) = plt.subplots(2, 1, figsize=figsize,
-                                         facecolor="#ffffff", sharex=True)
+                                         facecolor=BG_COLOR, sharex=True)
     for ax in [ax_iv, ax_rnd]:
-        ax.set_facecolor("#ffffff")
+        ax.set_facecolor(BG_COLOR)
         for spine in ax.spines.values():
             spine.set_edgecolor("#333333")
         ax.tick_params(colors="#111111")
@@ -359,13 +389,69 @@ def plot_compare(results: list, df=None, t_exp: float = None,
     ax_iv.set_ylabel("Implied Vol (%)", color="black")
     ax_rnd.set_ylabel("Risk-Neutral Density", color="black")
     ax_rnd.set_xlabel("Log-strike  k", color="black")
-    ax_iv.legend(fontsize=7.5, facecolor="#ffffff", edgecolor="#444444",
+    ax_iv.legend(fontsize=7.5, facecolor=BG_COLOR, edgecolor="#444444",
                  labelcolor="black")
 
     days = t_exp * 365.25
     fig.suptitle(f"Model comparison — T={t_exp:.4f} ({days:.1f}d)",
                  color="black", fontsize=11)
-    fig.patch.set_facecolor("#ffffff")
+    fig.patch.set_facecolor(BG_COLOR)
+    fig.tight_layout()
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5b.  RHO(THETA) TERM STRUCTURE — SSVI (constant) vs eSSVI (maturity-dependent)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_rho_comparison(res_ssvi: dict, res_essvi: dict, n_grid: int = 200,
+                        figsize=(7, 5)) -> plt.Figure:
+    """
+    Compare the fitted correlation term structure between a global SSVI fit
+    (constant rho) and a global eSSVI fit (rho(theta) = rho_inf +
+    (rho_0-rho_inf)*exp(-lam*theta)), plotted against time to expiry T.
+    Same idea as Figure 2 (right panel) in Hendriks & Martini's eSSVI paper
+    (SSRN id2971502), but with T on the x-axis instead of theta_T — rho only
+    depends on theta in the model, so theta(T) is interpolated (monotone
+    cubic, same method plot_surface uses) from the fitted per-slice
+    (T_i, theta_i) pairs to get a smooth curve in T.
+
+    Parameters
+    ----------
+    res_ssvi  : result dict from calibrate_global_ssvi
+    res_essvi : result dict from calibrate_global_essvi
+    n_grid    : resolution of the eSSVI rho(T) curve
+    """
+    model_essvi = _get_model(res_essvi)
+    rho_ssvi    = float(res_ssvi["params"][0]["rho"])
+
+    expiries_essvi = np.array(res_essvi["expiries"], dtype=float)
+    thetas_essvi   = np.array([p["theta"] for p in res_essvi["params"]])
+    p_ref          = res_essvi["params"][0]   # rho_0/rho_inf/lam are shared
+
+    theta_of_t   = PchipInterpolator(expiries_essvi, thetas_essvi, extrapolate=True)
+    t_grid       = np.linspace(expiries_essvi.min(), expiries_essvi.max(), n_grid)
+    rho_essvi_curve  = np.array([model_essvi._rho(th, p_ref) for th in theta_of_t(t_grid)])
+    rho_essvi_slices = np.array([model_essvi._rho(th, p_ref) for th in thetas_essvi])
+
+    fig, ax = plt.subplots(figsize=figsize, facecolor=BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333333")
+    ax.tick_params(colors="#111111")
+
+    ax.axhline(rho_ssvi, color=PALETTE[2], lw=2.0, label="SSVI (constant $\\rho$)")
+    ax.plot(t_grid, rho_essvi_curve, color=PALETTE[6], lw=2.0,
+           label="eSSVI  $\\rho(T)$")
+    ax.scatter(expiries_essvi, rho_essvi_slices, color=PALETTE[6], s=28,
+              zorder=5, edgecolor="#333333", linewidth=0.5)
+
+    ax.set_xlabel(r"$T$  (time to expiry, years)", color="black")
+    ax.set_ylabel(r"$\rho$", color="black")
+    ax.legend(fontsize=9, facecolor=BG_COLOR, edgecolor="#444444", labelcolor="black")
+
+    fig.suptitle("Correlation term structure — SSVI vs eSSVI", color="black", fontsize=11)
+    fig.patch.set_facecolor(BG_COLOR)
     fig.tight_layout()
     return fig
 
@@ -482,8 +568,7 @@ def plot_metric_by_date(
         models = list(first.keys())
 
     # Default style
-    default_colors  = ['#4C9BE8', '#E8814C', '#4CE882', '#9B59B6',
-                       '#E74C3C', '#1ABC9C', '#F39C12', '#2ECC71']
+    default_colors  = PALETTE_HEX
     default_markers = ['o', 's', '^', 'D', 'v', 'P', 'X', 'h']
     colors  = colors  or {m: default_colors[i % len(default_colors)]
                           for i, m in enumerate(models)}

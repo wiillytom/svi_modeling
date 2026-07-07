@@ -21,6 +21,18 @@ ENV_PY="${ENV_PY:-python}"
 ENV_ST="${ENV_ST:-streamlit}"
 
 cd "$(dirname "$0")"
+
+# Guard against launching with the wrong conda env's Python/Streamlit — this
+# has silently happened before (base env shadows the pinned one on PATH) and
+# surfaces as a confusing TypeError deep inside the Streamlit UI instead of
+# a clear message here.
+REQUIRED_ST=$(grep -i '^streamlit==' requirements.txt | cut -d= -f3)
+FOUND_ST=$("$ENV_PY" -c "import streamlit; print(streamlit.__version__)" 2>/dev/null || echo "MISSING")
+if [ "$FOUND_ST" != "$REQUIRED_ST" ]; then
+    echo "✖  Wrong environment: '$ENV_PY' resolves to streamlit $FOUND_ST, expected $REQUIRED_ST." >&2
+    echo "   Run 'conda activate natixis_internship' before ./run_live.sh, or set ENV_PY/ENV_ST explicitly." >&2
+    exit 1
+fi
 mkdir -p "2 - Data/live"
 
 # Resolve the list of currencies we'll gather
@@ -36,7 +48,7 @@ GATHERER_PIDS=()
 for ccy in "${CCYS[@]}"; do
     log="2 - Data/live/live_gather_${ccy}.log"
     echo "▶  starting gatherer  ($ccy, every ${POLL}s)  log=$log"
-    "$ENV_PY" volatility_surface/live_gather.py --currency "$ccy" --poll "$POLL" \
+    "$ENV_PY" volatility_surface/utils/live_gather.py --currency "$ccy" --poll "$POLL" \
         > "$log" 2>&1 &
     GATHERER_PIDS+=($!)
 done
@@ -57,4 +69,4 @@ echo "▶  spawned gatherer pids: ${GATHERER_PIDS[*]}"
 echo "▶  starting Streamlit app — open the printed URL in your browser"
 echo
 
-"$ENV_ST" run volatility_surface/streamlit_chain.py
+"$ENV_ST" run volatility_surface/utils/streamlit_chain.py

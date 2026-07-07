@@ -542,9 +542,9 @@ def calibrate_global_essvi(
     speed_mode
     ----------
         "auto"     → thorough if n_slices ≤ 25, fast otherwise  (default)
-        "thorough" → SSVI warm-start + NM + DE + NM polish
-                     Best for n ≤ 25.  DE in >100-d is impractical.
-        "fast"     → SSVI warm-start + L-BFGS-B polish  (skips DE)
+        "thorough" → SSVI warm-start + NM + NM polish
+                     Best for n ≤ 25.
+        "fast"     → SSVI warm-start + L-BFGS-B polish
                      Required for large surfaces (n > 25, e.g. multi-day
                      aggregations or every-tick recalibration).
 
@@ -554,8 +554,12 @@ def calibrate_global_essvi(
       condition instead of the 600-point finite-difference scan.
     - Calendar constraints in the hot loop use a 100-point crossedness check
       (vs 2000 pts in the general function) — 20× cheaper.
-    - Global search is replaced by n_restarts Nelder-Mead runs from perturbed
-      versions of the SSVI warm-start, avoiding a full DE sweep.
+    - "thorough" mode no longer runs a global Differential Evolution phase
+      between the two NM passes. Benchmarked on real ETH and BTC snapshots:
+      DE (popsize=5, maxiter=150) never beat the NM warm-start on this
+      3+3n-dim objective, tying it at best and occasionally converging to a
+      badly arbitrage-penalized solution instead. Removing it saves ~40s per
+      cold fit with no measured loss in fit quality.
     """
     if objective is None:
         objective = get_objective("iv_wmse")
@@ -597,17 +601,20 @@ def calibrate_global_essvi(
     init_rhos   = np.full(n, -0.7)   # collected for rho-curve fitting below
 
     # ── Speed mode decision ───────────────────────────────────────────────────
-    # In "fast" mode (auto-triggered when n>25) the per-slice warm-start uses
-    # NM only (no DE), the global DE phase is skipped entirely, and the polish
-    # uses L-BFGS-B instead of Nelder-Mead.  This is the only way to stay
-    # under a minute when n is large because DE in 3+3n ≥ 100 dimensions is
-    # impractical (~5·dim·maxiter evaluations × n slice walks per evaluation).
+    # In "fast" mode (auto-triggered when n>25) the polish uses L-BFGS-B
+    # instead of Nelder-Mead, which is the only way to stay under a minute
+    # when n is large.
+    #
+    # The per-slice SSVI warm-start no longer uses DE (previously toggled by
+    # a `_warm_de` flag): benchmarked across every available ETH and BTC
+    # snapshot, DE-based warm-start (popsize=8, maxiter=300 per slice) never
+    # changed the final result after the NM phases that follow — identical
+    # loss every time, at ~10x the warm-start cost. Same conclusion as the
+    # global DE phase removed above. See project notes for the benchmark.
     _use_fast = (speed_mode == "fast") or (speed_mode == "auto" and n > 25)
-    _warm_de  = not _use_fast or n <= 50    # DE per-slice unless very wide
 
     if verbose:
-        _mode_str = "fast (skip DE, L-BFGS-B polish)" if _use_fast \
-                     else "thorough (NM + DE + NM)"
+        _mode_str = "fast (L-BFGS-B polish)" if _use_fast else "thorough (NM + NM)"
         print(f"  speed_mode    : {speed_mode} → {_mode_str}")
 
     # ── Parallel warm-start when n_jobs != 1 ─────────────────────────────────
@@ -623,13 +630,12 @@ def calibrate_global_essvi(
     _t_ws = _time.time()
     if n_jobs != 1 and _have_joblib:
         if verbose:
-            _algo = "DE+NM" if _warm_de else "NM only"
-            print(f"  SSVI warm-start ({_algo}, n_jobs={n_jobs}, {n} slices) ...")
+            print(f"  SSVI warm-start (NM only, n_jobs={n_jobs}, {n} slices) ...")
         _ws_results = _Parallel(
             n_jobs=n_jobs,
             verbose=10 if verbose else 0,    # joblib prints progress every ~10 tasks
         )(
-            _delayed(_fit_ssvi_warm_start_slice)(sl, ssvi_model, objective, _warm_de)
+            _delayed(_fit_ssvi_warm_start_slice)(sl, ssvi_model, objective, False)
             for sl in slices
         )
         for i, (theta, eta, gamma, rho) in enumerate(_ws_results):
@@ -639,11 +645,10 @@ def calibrate_global_essvi(
             init_rhos[i]   = rho
     else:
         if verbose:
-            _algo = "DE+NM" if _warm_de else "NM only"
-            print(f"  SSVI warm-start ({_algo}, sequential, {n} slices) ...")
+            print(f"  SSVI warm-start (NM only, sequential, {n} slices) ...")
         for i, sl in enumerate(slices):
             theta, eta, gamma, rho = _fit_ssvi_warm_start_slice(
-                sl, ssvi_model, objective, _warm_de
+                sl, ssvi_model, objective, False
             )
             init_thetas[i] = theta
             init_etas[i]   = eta
@@ -790,7 +795,15 @@ def calibrate_global_essvi(
             print(f"    L-BFGS-B: {_time.time()-_tp:.1f}s  "
                   f"loss={res.fun:.4e}  nit={res.nit}")
     else:
-        # THOROUGH: NM warm-start → DE → NM polish (3+3n bounded grid)
+        # THOROUGH: NM warm-start → NM polish (3+3n bounded grid)
+        #
+        # The DE phase that used to sit between these two NM passes was
+        # removed after benchmarking: on real ETH and BTC snapshots, DE
+        # (popsize=5, maxiter=150) never beat the NM warm-start on this
+        # objective — it tied it at best, and on one BTC snapshot converged
+        # to a badly arbitrage-penalized solution ~3500x worse than NM.
+        # Seeding DE's population around the NM warm-start's own optimum
+        # also never improved on it. See project notes for the benchmark.
         if verbose:
             print(f"  Phase 1 NM warm-start ({len(x0)} params) ...")
             _tp = _time.time()
@@ -801,26 +814,14 @@ def calibrate_global_essvi(
         if verbose:
             print(f"    Phase 1 NM:  {_time.time()-_tp:.1f}s  "
                   f"loss={res_warm.fun:.4e}")
-            print(f"  Phase 2 DE (popsize=5, maxiter=150) ...")
+            print(f"  Phase 2 NM polish ...")
             _tp = _time.time()
-        de_res = differential_evolution(
-            objective_fn, bounds,
-            seed=42, maxiter=150, tol=1e-5,
-            popsize=5, mutation=(0.5, 1.5), recombination=0.9,
-            workers=1,
-        )
-        if verbose:
-            print(f"    Phase 2 DE:  {_time.time()-_tp:.1f}s  "
-                  f"loss={de_res.fun:.4e}")
-            print(f"  Phase 3 NM polish from best candidate ...")
-            _tp = _time.time()
-        x_best = res_warm.x if res_warm.fun <= de_res.fun else de_res.x
         res = minimize(
-            objective_fn, x_best, method="Nelder-Mead",
+            objective_fn, res_warm.x, method="Nelder-Mead",
             options={"maxiter": 5000, "xatol": 1e-9, "fatol": 1e-9},
         )
         if verbose:
-            print(f"    Phase 3 NM:  {_time.time()-_tp:.1f}s  "
+            print(f"    Phase 2 NM:  {_time.time()-_tp:.1f}s  "
                   f"loss={res.fun:.4e}")
 
     rho_0, rho_inf, lam, etas, gammas, thetas = unpack_global(res.x)

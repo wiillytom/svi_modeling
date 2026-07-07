@@ -69,18 +69,33 @@ def make_objective(model, k_arr, w_arr, iv_arr, vega_arr, t_exp, objective_fn):
     return objective
 
 
-def run_nelder_mead(model, objective, k_arr, w_arr, t_exp, maxiter):
+def run_nelder_mead(model, objective, k_arr, w_arr, t_exp, maxiter, frame_stride=1):
+    """
+    Run Nelder-Mead for `maxiter` iterations, but only keep one frame every
+    `frame_stride` iterations (e.g. maxiter=500, frame_stride=25 -> 20 frames).
+    The optimizer itself still runs the full `maxiter` iterations — stride only
+    thins what gets rendered into the GIF. The true final (converged) frame is
+    always kept even if it doesn't land on the stride, so the GIF still ends
+    on the actual fit.
+    """
     x0 = model.pack(model.initial_guess(k_arr, w_arr, t_exp))
     frames = [(0, x0.copy(), objective(x0))]
+    iteration = 0
 
     def callback(xk):
-        frames.append((len(frames), xk.copy(), objective(xk)))
+        nonlocal iteration
+        iteration += 1
+        if iteration % frame_stride == 0:
+            frames.append((iteration, xk.copy(), objective(xk)))
 
-    minimize(
+    res = minimize(
         objective, x0, method="Nelder-Mead", callback=callback,
         options={"maxiter": maxiter, "xatol": 1e-7, "fatol": 1e-7},
     )
-    print(f"[Nelder-Mead] {len(frames)} iterations captured, final loss={frames[-1][2]:.5f}")
+    if iteration % frame_stride != 0:
+        frames.append((iteration, res.x.copy(), objective(res.x)))
+    print(f"[Nelder-Mead] {iteration} iterations run, {len(frames)} frames kept "
+          f"(1 per {frame_stride}), final loss={frames[-1][2]:.5f}")
     return frames
 
 
@@ -142,6 +157,9 @@ def main():
                         help="Which sorted expiry to animate (default: 6)")
     parser.add_argument("--objective", default="vega_wmse")
     parser.add_argument("--nm-maxiter", type=int, default=120)
+    parser.add_argument("--nm-frame-stride", type=int, default=1,
+                        help="keep 1 Nelder-Mead frame every N iterations "
+                             "(e.g. --nm-maxiter 500 --nm-frame-stride 25 -> 20 frames)")
     parser.add_argument("--de-maxiter", type=int, default=40)
     parser.add_argument("--de-popsize", type=int, default=12)
     parser.add_argument("--seed", type=int, default=7)
@@ -163,7 +181,8 @@ def main():
     objective = make_objective(model, k_arr, w_arr, iv_arr, vega_arr, t_exp, objective_fn)
 
     print("\nRunning Nelder-Mead...")
-    nm_frames = run_nelder_mead(model, objective, k_arr, w_arr, t_exp, args.nm_maxiter)
+    nm_frames = run_nelder_mead(model, objective, k_arr, w_arr, t_exp,
+                                args.nm_maxiter, args.nm_frame_stride)
     render_gif(nm_frames, model, k_arr, iv_arr, t_exp,
               outdir / "calibration_nelder_mead.gif", "Nelder-Mead", args.fps)
 

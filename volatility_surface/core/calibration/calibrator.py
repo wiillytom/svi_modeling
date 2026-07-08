@@ -809,16 +809,16 @@ def calibrate_global_essvi(
             _tp = _time.time()
         res_warm = minimize(
             objective_fn, x0, method="Nelder-Mead",
-            options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-6},
+            options={"maxiter":2000 , "xatol": 1e-15, "fatol": 1e-15},
         )
         if verbose:
-            print(f"    Phase 1 NM:  {_time.time()-_tp:.1f}s  "
+            print(f"    Phase 1 NM:  {_time.time()-_tp:.1f}s (200k maxiter) "
                   f"loss={res_warm.fun:.4e}")
             print(f"  Phase 2 NM polish ...")
             _tp = _time.time()
         res = minimize(
             objective_fn, res_warm.x, method="Nelder-Mead",
-            options={"maxiter": 5000, "xatol": 1e-9, "fatol": 1e-9},
+            options={"maxiter": 5000, "xatol": 1e-15, "fatol": 1e-15},
         )
         if verbose:
             print(f"    Phase 2 NM:  {_time.time()-_tp:.1f}s  "

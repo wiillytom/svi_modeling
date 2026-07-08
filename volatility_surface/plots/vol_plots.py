@@ -10,14 +10,17 @@ Functions
 ---------
     plot_surface(result)            3D implied vol surface
     plot_slices(result, df)         Per-slice smile + RND subplots
+    plot_price_vs_bidask(result, df)  Per-slice fitted price vs market bid/ask
     plot_total_variance(result)     Gatheral-style total variance overlay
     plot_metrics(result)            Bar chart of per-slice fit metrics
     plot_compare(results, df)       Overlay multiple model fits on one slice
+    plot_fitted_term_structure(result, df)    Every fitted expiry, one strike axis
     plot_rho_comparison(res_ssvi, res_essvi)  SSVI (const) vs eSSVI rho(theta)
     plot_all(result, df)            Generate all plots at once
 """
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.dates as mdates
@@ -226,6 +229,138 @@ def plot_slices(result: dict, df=None, n_cols=3,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2b.  PER-SLICE FITTED PRICE vs MARKET BID/ASK
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_price_vs_bidask(result: dict, df, n_cols=3, r: float = 0.0,
+                         k_plot_range=(-2.0, 2.0), n_grid=400,
+                         figsize=None) -> plt.Figure:
+    """
+    One subplot per expiry: the fitted vol smile converted to option price
+    (Black-76 — forward-normalized, F=1, matching this codebase's k=log(K/F)
+    convention throughout), against the market bid/ask price band, plotted
+    against strike K. Companion to `plot_slices`, in price space instead of
+    vol space.
+
+    Below k=0 the curve is priced as an OTM put, at/above k=0 as an OTM
+    call — matching this codebase's OTM-only convention. The model is
+    always evaluated in log-moneyness k (that's the only space model.iv()
+    and the call/put split understand) and converted to strike only for
+    the x-axis, via K = F * exp(k).
+
+    Parameters
+    ----------
+    result : calibration result dict (must contain '_model', 'expiries', 'params')
+    df     : snapshot DataFrame with columns k, t, option_type, bid_price,
+             ask_price, strike, underlying_price
+    r      : Black-76 discount rate (default 0 — undiscounted)
+    """
+    from volatility_surface.core.pricing.pricing_models import gk_price
+
+    model      = _get_model(result)
+    expiries   = result["expiries"]
+    params_list = result["params"]
+    n_slices   = len(expiries)
+
+    n_cols = min(n_cols, n_slices)
+    n_rows = int(np.ceil(n_slices / n_cols))
+    if figsize is None:
+        figsize = (5.5 * n_cols, 4.2 * n_rows)
+
+    fig = plt.figure(figsize=figsize, facecolor=BG_COLOR)
+
+    for idx, (t_exp, p) in enumerate(zip(expiries, params_list)):
+        ax = fig.add_subplot(n_rows, n_cols, idx + 1)
+
+        df_slice = df[df["t"] == t_exp] if df is not None else None
+        k_lo, k_hi = _k_range(df_slice, global_range=k_plot_range)
+        k_grid     = np.linspace(k_lo, k_hi, n_grid)
+
+        # Representative forward for this maturity, for the continuous fitted
+        # curve's x-axis only (median across the slice's own rows — each row
+        # already carries its own precise underlying_price, used directly
+        # below wherever we convert an OBSERVED row's price to USD).
+        F_repr = float(df_slice["underlying_price"].median()) if df_slice is not None and len(df_slice) > 0 else 1.0
+        K_grid_usd = F_repr * np.exp(k_grid)
+
+        # Fitted price curve: IV -> Black-76 price, OTM put for k<0, OTM call for k>=0.
+        # Black-76 = Garman-Kohlhagen with q=r (forward already embeds carry,
+        # so no extra (r-q) drift should be injected into d1) and S=F=1.
+        iv_fit   = model.iv(k_grid, p, t_exp)
+        K_norm   = np.exp(k_grid)
+        opt_type = np.where(k_grid >= 0, "c", "p")
+        price_fit = gk_price(1.0, K_norm, t_exp, r, r, iv_fit, opt_type)
+        ax.plot(K_grid_usd, price_fit, color=FIT_COLOR, lw=1.0,
+               label=f"{model.name} fit", zorder=3)
+
+        # Market bid/ask price band, against real strikes
+        days = t_exp * 365.25
+        avg_price_err_rel = None
+        avg_price_err_usd = None
+        if df_slice is not None and len(df_slice) > 0:
+            df_slice = df_slice.sort_values("strike")
+            K_atm = df_slice.loc[df_slice["k"].abs().idxmin(), "strike"]
+
+            ax.scatter(df_slice["strike"], df_slice["bid_price"], color=BID_COLOR, s=12,
+                      alpha=0.8, marker="x", label="Bid", zorder=4)
+            ax.scatter(df_slice["strike"], df_slice["ask_price"], color=ASK_COLOR, s=12,
+                      alpha=0.8, marker="x", label="Ask", zorder=4)
+            ax.axvline(K_atm, color="#555555", lw=0.8, ls="--", zorder=0)
+
+            # Average price error RELATIVE to the option's own premium, but
+            # measured as distance to the BID/ASK SPREAD rather than to the
+            # mid: zero whenever the fitted price already falls inside
+            # [bid, ask] (matching the spirit of the IV-space spread_hit_rate
+            # metric), and the shortfall/excess past the nearer edge as a
+            # fraction of mid price otherwise. Same 1e-8 floor
+            # objectives.py's metric_price_rrmse uses, so a near-zero
+            # deep-OTM premium doesn't blow up the ratio. Also reported in
+            # fiat (USD) — dist_to_spread is in the same normalized
+            # (fraction-of-spot) units as everything else here, so convert
+            # to USD using each ROW'S OWN underlying_price (not a single
+            # slice-wide forward) — rigorous in case the forward drifted
+            # slightly between quotes captured within the same snapshot/slice.
+            k_obs      = df_slice["k"].to_numpy()
+            F_obs      = df_slice["underlying_price"].to_numpy()
+            iv_fit_obs = model.iv(k_obs, p, t_exp)
+            price_fit_obs = gk_price(1.0, np.exp(k_obs), t_exp, r, r, iv_fit_obs,
+                                     df_slice["option_type"].to_numpy())
+            bid_obs = df_slice["bid_price"].to_numpy()
+            ask_obs = df_slice["ask_price"].to_numpy()
+            mid_obs = df_slice["mid_price"].to_numpy()
+            dist_to_spread = np.maximum(0.0, np.maximum(bid_obs - price_fit_obs,
+                                                         price_fit_obs - ask_obs))
+            err_rel = dist_to_spread / np.maximum(mid_obs, 1e-8)
+            avg_price_err_rel = float(np.mean(err_rel))
+            avg_price_err_usd = float(np.mean(dist_to_spread * F_obs))
+            print(f"  T={t_exp:.4f} ({days:.1f}d)  avg_price_error={avg_price_err_rel:.2%} "
+                  f"of premium beyond spread (${avg_price_err_usd:,.2f})  "
+                  f"(n={len(df_slice)} strikes)")
+
+        title_str = f"T={t_exp:.4f} ({days:.1f}d)"
+        if avg_price_err_rel is not None:
+            title_str += (f"\naverage distance from spread={avg_price_err_rel:.1%} of "
+                          f"option premium (${avg_price_err_usd:,.2f})")
+        ax.set_title(title_str, color="black", fontsize=8.5, pad=5)
+        ax.set_xlabel("Strike", color="#111111", fontsize=7.5)
+        ax.set_ylabel("Price  (fraction of spot)", color="#111111", fontsize=7.5)
+        ax.tick_params(colors="#111111", labelsize=7)
+        ax.set_facecolor(BG_COLOR)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#333333")
+
+        if idx == 0:
+            ax.legend(fontsize=6.5, facecolor=BG_COLOR, edgecolor="#444444",
+                     labelcolor="black", loc="upper right")
+
+    for idx in range(n_slices, n_rows * n_cols):
+        fig.add_subplot(n_rows, n_cols, idx + 1).set_visible(False)
+
+    fig.suptitle(f"{result['model_name']} — Fitted Price vs Market Bid/Ask",
+                 color="black", fontsize=12, y=1.01)
+    fig.patch.set_facecolor(BG_COLOR)
+    fig.tight_layout()
+    return fig
+# ─────────────────────────────────────────────────────────────────────────────
 # 3.  TOTAL VARIANCE OVERLAY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -401,7 +536,73 @@ def plot_compare(results: list, df=None, t_exp: float = None,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5b.  RHO(THETA) TERM STRUCTURE — SSVI (constant) vs eSSVI (maturity-dependent)
+# 5b.  FITTED TERM STRUCTURE IN STRIKE SPACE — one snapshot, every expiry
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_fitted_term_structure(result: dict, df: pd.DataFrame, k_pad: float = 0.6,
+                               asset_label: str = None, xaxis: str = 'moneyness',figsize=(10, 5)) -> plt.Figure:
+    """
+    Overlay every fitted expiry's smile from ONE snapshot on a shared strike
+    axis, coloured by expiry (short = light, long = dark) with the project's
+    trimmed RdPu colormap. Classic post-calibration diagnostic (Reiswich-
+    Wystup / Sepp style): short expiries show narrow, steep-winged coverage;
+    long expiries flatten out and broaden.
+
+    Parameters
+    ----------
+    result      : calibration result dict (must contain '_model', 'expiries', 'params')
+    df          : the snapshot DataFrame the fit was calibrated on (used for
+                  each slice's observed k-range and the underlying forward)
+    k_pad       : how far beyond each slice's observed k-range to extend the
+                  fitted curve
+    asset_label : optional ticker (e.g. "ETH") shown in the title next to
+                  the underlying price
+    xaxis       : ['strike','moneyness']
+    """
+    model    = _get_model(result)
+    expiries = result["expiries"]
+    colors   = _n_colors(len(expiries))
+
+    fig, ax = plt.subplots(figsize=figsize, facecolor=BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333333")
+    ax.tick_params(colors="#111111")
+
+    for i, (t, params) in enumerate(zip(expiries, result["params"])):
+        if params is None:
+            continue
+        s_sub = df[np.isclose(df["t"], t)]
+        if s_sub.empty:
+            continue
+        F      = float(s_sub["underlying_price"].iloc[0])
+        k_grid = np.linspace(s_sub["k"].min() - k_pad, s_sub["k"].max() + k_pad, 200)
+        iv     = model.iv(k_grid, params, t)
+        if xaxis=='strike':
+            ax.plot(F * np.exp(k_grid), iv * 100, lw=1.6,
+               color=colors[i], label=f"{t*365:.0f}d")
+        elif xaxis=='moneyness':
+            ax.plot((k_grid), iv * 100, lw=1.6,
+               color=colors[i], label=f"{t*365:.0f}d")
+
+    ax.set(xlabel="strike (USD)", ylabel="fitted IV (%)",
+           title="fitted vols in strike space")
+    ax.legend(fontsize=7, ncol=2, loc="upper right", facecolor=BG_COLOR,
+             edgecolor="#444444", labelcolor="black")
+
+    F_snap  = float(df["underlying_price"].median())
+    snap_ts = df["file_timestamp"].iloc[0] if "file_timestamp" in df.columns else ""
+    label   = f"{asset_label} " if asset_label else ""
+    fig.suptitle(f"Term structure of fitted {result['model_name']} vols   —   "
+                f"{snap_ts}   {label}≈ ${F_snap:,.0f}",
+                fontsize=12, color="#6A0DAD", y=1.02)
+    fig.patch.set_facecolor(BG_COLOR)
+    fig.tight_layout()
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5c.  RHO(THETA) TERM STRUCTURE — SSVI (constant) vs eSSVI (maturity-dependent)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_rho_comparison(res_ssvi: dict, res_essvi: dict, n_grid: int = 200,

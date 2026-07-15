@@ -12,6 +12,7 @@ Functions
     plot_slices(result, df)         Per-slice smile + RND subplots
     plot_price_vs_bidask(result, df)  Per-slice fitted price vs market bid/ask
     plot_total_variance(result)     Gatheral-style total variance overlay
+    plot_vega(result)               Black-Scholes vega (or vega**power) by expiry
     plot_metrics(result)            Bar chart of per-slice fit metrics
     plot_compare(results, df)       Overlay multiple model fits on one slice
     plot_fitted_term_structure(result, df)    Every fitted expiry, one strike axis
@@ -97,8 +98,21 @@ def _scatter_market(ax, df_slice, t):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_surface(result: dict, k_range=(-2.0, 2.0), n_k=200, n_t=100,
-                 colormap=None, figsize=(12, 7)) -> plt.Figure:
-    """3D implied volatility surface across all fitted expiries."""
+                 colormap=None, figsize=(12, 7), elev=30, azim=-60) -> plt.Figure:
+    """
+    3D implied volatility surface across all fitted expiries.
+
+    Parameters
+    ----------
+    elev, azim : initial camera angle (matplotlib 3D convention: elev = tilt
+        above the k-T plane, azim = rotation around the vertical axis).
+        Call again with different values for a different static view, e.g.
+        plot_surface(result, elev=15, azim=100). If your matplotlib backend
+        is interactive (e.g. %matplotlib widget in Jupyter, or any GUI
+        backend/window instead of an inline static image), you can also
+        click-and-drag the rendered figure to rotate freely — elev/azim
+        here only set where it starts.
+    """
     if colormap is None:
         colormap = CMAP
     model      = _get_model(result)
@@ -137,6 +151,7 @@ def plot_surface(result: dict, k_range=(-2.0, 2.0), n_k=200, n_t=100,
     ax.set_zlabel("Implied Vol  σ", color="black", labelpad=8)
     ax.set_title(f"{result['model_name']} — Implied Volatility Surface",
                  color="black", fontsize=12, pad=14)
+    ax.view_init(elev=elev, azim=azim)
 
     for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
         pane.fill = True
@@ -153,11 +168,19 @@ def plot_surface(result: dict, k_range=(-2.0, 2.0), n_k=200, n_t=100,
 
 def plot_slices(result: dict, df=None, n_cols=3,
                 k_plot_range=(-2.0, 2.0), n_grid=400,
-                figsize=None) -> plt.Figure:
-    """One subplot per expiry: fitted smile on left axis, RND on right axis."""
+                figsize=None, slice_idx=None) -> plt.Figure:
+    """One subplot per expiry: fitted smile on left axis, RND on right axis.
+
+    slice_idx : optional list of integer indices into result['expiries'] to
+                restrict the plot to a subset of maturities, e.g. [2, 5, 8, 11].
+                None (default) plots every expiry.
+    """
     model      = _get_model(result)
     expiries   = result["expiries"]
     params_list = result["params"]
+    if slice_idx is not None:
+        expiries    = [expiries[i]    for i in slice_idx]
+        params_list = [params_list[i] for i in slice_idx]
     n_slices   = len(expiries)
 
     n_cols = min(n_cols, n_slices)
@@ -233,7 +256,7 @@ def plot_slices(result: dict, df=None, n_cols=3,
 # ─────────────────────────────────────────────────────────────────────────────
 def plot_price_vs_bidask(result: dict, df, n_cols=3, r: float = 0.0,
                          k_plot_range=(-2.0, 2.0), n_grid=400,
-                         figsize=None) -> plt.Figure:
+                         figsize=None, slice_idx=None) -> plt.Figure:
     """
     One subplot per expiry: the fitted vol smile converted to option price
     (Black-76 — forward-normalized, F=1, matching this codebase's k=log(K/F)
@@ -253,12 +276,18 @@ def plot_price_vs_bidask(result: dict, df, n_cols=3, r: float = 0.0,
     df     : snapshot DataFrame with columns k, t, option_type, bid_price,
              ask_price, strike, underlying_price
     r      : Black-76 discount rate (default 0 — undiscounted)
+    slice_idx : optional list of integer indices into result['expiries'] to
+             restrict the plot to a subset of maturities, e.g. [2, 5, 8, 11].
+             None (default) plots every expiry.
     """
     from volatility_surface.core.pricing.pricing_models import gk_price
 
     model      = _get_model(result)
     expiries   = result["expiries"]
     params_list = result["params"]
+    if slice_idx is not None:
+        expiries    = [expiries[i]    for i in slice_idx]
+        params_list = [params_list[i] for i in slice_idx]
     n_slices   = len(expiries)
 
     n_cols = min(n_cols, n_slices)
@@ -366,12 +395,136 @@ def plot_price_vs_bidask(result: dict, df, n_cols=3, r: float = 0.0,
 
 def plot_total_variance(result: dict, k_range=(-2.0, 2.0), n_grid=400,
                         figsize=(10, 5), cmap=None,
-                        n_cbar_ticks=8) -> plt.Figure:
+                        n_cbar_ticks=8, shuffle_colors=False,
+                        penalty_cal=None, snapshot_ts=None) -> plt.Figure:
     """
     Gatheral-style total variance plot.
     Colour encodes maturity continuously — no per-line legend.
     Crossed lines = calendar spread arbitrage.
+
+    shuffle_colors : if True, curves alternate between the dark end and the
+        light end of the colormap in T-order — every other curve (1st, 3rd,
+        5th, ...) is drawn from the dark half, the rest (2nd, 4th, 6th, ...)
+        from the light half. This guarantees every ADJACENT pair of curves
+        (the ones most likely to be hugging each other in a well-fit no-arb
+        chain) gets high contrast, unlike a smooth gradient where adjacent
+        maturities get near-identical colours right where distinguishing
+        them matters most. Falls back to a legend (T-labelled) instead of
+        the continuous colorbar, since the colorbar would otherwise
+        misrepresent the (now alternating) line colours.
+    penalty_cal : the penalty_cal value the calibration was actually run
+        with (not stored in `result` — pass the same value you gave
+        calibrate_snapshot/calibrate_global_*). Purely for display in the
+        title; has no effect on the plot itself. Omit to leave it off.
+    snapshot_ts : the snapshot's file_timestamp (also not stored in
+        `result` — pass the same SNAP_TS you loaded the data with).
+        Purely for display in the title. Omit to leave it off.
     """
+    from volatility_surface.core.calibration.calibrator import crossedness
+
+    model       = _get_model(result)
+    expiries    = np.array(result["expiries"])
+    params_list = result["params"]
+
+    k_grid   = np.linspace(k_range[0], k_range[1], n_grid)
+    colormap = CMAP if cmap is None else plt.get_cmap(cmap)
+    t_min, t_max = expiries.min(), expiries.max()
+    norm = mcolors.Normalize(vmin=t_min, vmax=t_max)
+
+    # Worst calendar crossedness across EVERY pair of slices (not just
+    # adjacent ones) — matches the rigorous check, not just the one the
+    # calibration objective itself enforces.
+    worst_cross = 0.0
+    for i in range(len(params_list)):
+        for j in range(i + 1, len(params_list)):
+            worst_cross = max(worst_cross, crossedness(model, params_list[i], params_list[j]))
+
+    fig, ax = plt.subplots(figsize=figsize, facecolor=BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+
+    if shuffle_colors:
+        n = len(expiries)
+        # Two FIXED representative colours (not a gradient per bucket) — a
+        # gradient within each bucket inevitably drifts its tail end toward
+        # the other bucket's range as n grows, killing contrast right where
+        # it's needed. A flat dark/light split guarantees every adjacent
+        # pair gets the same fixed high contrast regardless of n.
+        positions = np.where(np.arange(n) % 2 == 0, 0.9, 0.3)
+    else:
+        positions = norm(expiries)
+
+    for t_exp, p, pos in zip(expiries, params_list, positions):
+        color = colormap(pos)
+        ax.plot(k_grid, model.w(k_grid, p), color=color, lw=1.4, alpha=0.85,
+               label=f"T={t_exp:.4f}")
+
+    ax.axvline(0, color="#555555", lw=0.8, ls="--")
+    ax.set_xlabel("Log-strike  k", color="black")
+    ax.set_ylabel("Total implied variance  w = σ²T", color="black")
+    subtitle = f"worst crossedness={worst_cross:.4f}"
+    if penalty_cal is not None:
+        subtitle += f"   penalty_cal={penalty_cal:g}"
+    if snapshot_ts is not None:
+        subtitle += f"   snapshot={snapshot_ts}"
+    ax.set_title(f"{result['model_name']} — Total Variance (no lines should cross)\n{subtitle}",
+                 color="black")
+    ax.tick_params(colors="#111111")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333333")
+
+    if shuffle_colors:
+        ax.legend(fontsize=6.5, ncol=2, loc="best", facecolor=BG_COLOR,
+                 edgecolor="#444444", labelcolor="black")
+        fig.tight_layout()
+        return fig
+
+    sm   = ScalarMappable(cmap=colormap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02, fraction=0.03)
+    cbar.set_label("Time to expiry  T (years)", color="black", fontsize=9)
+    tick_vals = np.linspace(t_min, t_max, n_cbar_ticks)
+    cbar.set_ticks(tick_vals)
+    cbar.set_ticklabels([f"{t:.3f}" for t in tick_vals])
+    cbar.ax.yaxis.set_tick_params(color="black", labelsize=7.5)
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="black")
+    cbar.outline.set_edgecolor("#444444")
+
+    fig.tight_layout()
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b.  BLACK-SCHOLES VEGA BY EXPIRY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_vega(result: dict, k_range=(-2.0, 2.0), n_grid=400,
+             figsize=(10, 5), cmap=None, n_cbar_ticks=8,
+             power=1, snapshot_ts=None) -> plt.Figure:
+    """
+    Black-Scholes vega (or vega**power) against log-strike, one curve per
+    fitted expiry, colour-coded by maturity — same style as
+    plot_total_variance (same colourbar, same per-expiry overlay). Vega is
+    computed from each slice's own FITTED smile (model.iv), not raw market
+    quotes, so it reflects exactly what the vega_wmse-family objectives
+    actually see during calibration.
+
+    Useful for seeing directly why vega-weighted objectives concentrate so
+    heavily at the money: vega itself is already a decaying, roughly
+    Gaussian bump peaked at k=0 (set power=2 to see the vega_wmse default's
+    actual per-point weight, which decays roughly twice as fast in log
+    terms as plain vega — see obj_iv_vega_wmse's docstring for why squaring
+    is the economically-motivated choice, a first-order price-space
+    equivalence, not just an empirical preference).
+
+    Parameters
+    ----------
+    power : plot vega**power instead of raw vega (e.g. power=2 to match
+        vega_wmse's default weighting, power=1 for vega_wmse_linear's).
+    snapshot_ts : optional, for display in the title only (not stored in
+        `result` — pass the same SNAP_TS you loaded the data with).
+    """
+    from volatility_surface.core.calibration.objectives import _bs_vega
+
     model       = _get_model(result)
     expiries    = np.array(result["expiries"])
     params_list = result["params"]
@@ -386,13 +539,17 @@ def plot_total_variance(result: dict, k_range=(-2.0, 2.0), n_grid=400,
 
     for t_exp, p in zip(expiries, params_list):
         color = colormap(norm(t_exp))
-        ax.plot(k_grid, model.w(k_grid, p), color=color, lw=1.4, alpha=0.85)
+        iv    = model.iv(k_grid, p, t_exp)
+        vega  = _bs_vega(k_grid, iv, t_exp)
+        ax.plot(k_grid, vega ** power, color=color, lw=1.4, alpha=0.85)
 
     ax.axvline(0, color="#555555", lw=0.8, ls="--")
     ax.set_xlabel("Log-strike  k", color="black")
-    ax.set_ylabel("Total implied variance  w = σ²T", color="black")
-    ax.set_title(f"{result['model_name']} — Total Variance (no lines should cross)",
-                 color="black")
+    ax.set_ylabel("Vega" if power == 1 else f"Vega$^{power}$", color="black")
+    title = f"Black-Scholes Vega" + ("" if power == 1 else f"$^{power}$")
+    if snapshot_ts is not None:
+        title += f"\nsnapshot={snapshot_ts}"
+    ax.set_title(title, color="black")
     ax.tick_params(colors="#111111")
     for spine in ax.spines.values():
         spine.set_edgecolor("#333333")

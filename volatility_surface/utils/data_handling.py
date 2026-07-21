@@ -28,6 +28,14 @@ def clean_df(path: str, filter_rows: bool = True):
     """
 
     df = pd.read_csv(path)
+    if df.empty:
+        return df
+
+    # Grab the snapshot timestamp from the raw frame, before any filtering —
+    # a snapshot with zero rows surviving the no-arb boundary filter is a
+    # normal (if illiquid) outcome, not an error; taking .iloc[0] off the
+    # already-filtered frame crashed on those instead of returning empty.
+    ts = df.creation_timestamp_x.iloc[0]
 
     if filter_rows:
         df = df[df.volume>0]
@@ -38,7 +46,6 @@ def clean_df(path: str, filter_rows: bool = True):
         clean_df = df.copy()
 
     #Timestamp standardisation
-    ts = clean_df.creation_timestamp_x.iloc[0]
     clean_df['creation_timestamp_x'] = ts
     clean_df['creation_timestamp_x'] = clean_df['creation_timestamp_x'] #2h, paris = gmt +2
     clean_df['expiration_timestamp'] = pd.to_datetime(clean_df['expiration_timestamp'], format='%d%b%y')+pd.Timedelta(hours=8)
@@ -60,8 +67,16 @@ def clean_df(path: str, filter_rows: bool = True):
         otm_put_mask = (clean_df.option_type=='P') & (clean_df.k<=0)
         clean_df = clean_df[otm_call_mask | otm_put_mask]
 
-    #IV Quotes
-    clean_df[['bid_iv','ask_iv']] = clean_df.apply(implied_volatility_dataframe, axis=1, result_type='expand')
+    if clean_df.empty:
+        # `.apply(..., result_type='expand')` on an empty frame returns 0
+        # columns, not 2 — assigning that into ['bid_iv','ask_iv'] raises.
+        # A snapshot with nothing left after filtering is a normal (illiquid)
+        # outcome, not an error.
+        clean_df['bid_iv'] = pd.Series(dtype=float)
+        clean_df['ask_iv'] = pd.Series(dtype=float)
+    else:
+        #IV Quotes
+        clean_df[['bid_iv','ask_iv']] = clean_df.apply(implied_volatility_dataframe, axis=1, result_type='expand')
     if filter_rows:
         clean_df.dropna(subset=['bid_iv','ask_iv'], inplace=True)
     clean_df['half_spread_iv'] = (clean_df['ask_iv'] - clean_df['bid_iv'])/2

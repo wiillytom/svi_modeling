@@ -107,11 +107,23 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
         call_boundary = (pl.col('option_type') == 'C') & (pl.col('bid_price') < 1)
         df = df.filter(pl.col('volume') > 0).filter(put_boundary | call_boundary)
 
+    # Two schemas seen in the wild: the live gatherer's raw CSVs store a bare
+    # expiry DATE string ("5JUN26", no time-of-day — Deribit settles at 08:00
+    # UTC, so +8h is added after parsing to get the real settlement instant).
+    # A bulk historical dump can instead already carry a fully-resolved
+    # epoch-ms int (settlement time baked in — confirmed by decoding a sample:
+    # 1738569600000 -> 2025-02-03 08:00:00 UTC, exactly midnight+8h). Adding
+    # +8h to that would double-count the offset, so detect and branch instead
+    # of assuming the string format unconditionally.
+    if df.schema['expiration_timestamp'] == pl.Utf8:
+        df = df.with_columns(
+            (pl.col('expiration_timestamp').str.strptime(pl.Datetime, '%d%b%y') + pl.duration(hours=8)).alias('expiration_timestamp')
+        )
+        df = df.with_columns(pl.col('expiration_timestamp').dt.epoch(time_unit='ms').alias('expiration_timestamp_ms'))
+    else:
+        df = df.with_columns(pl.col('expiration_timestamp').cast(pl.Int64).alias('expiration_timestamp_ms'))
+
     df = df.with_columns(
-        (pl.col('expiration_timestamp').str.strptime(pl.Datetime, '%d%b%y') + pl.duration(hours=8)).alias('expiration_timestamp')
-    )
-    df = df.with_columns(
-        pl.col('expiration_timestamp').dt.epoch(time_unit='ms').alias('expiration_timestamp_ms'),
         pl.from_epoch(pl.col('creation_timestamp_x'), time_unit='ms').dt.strftime('%Y-%m-%d %H:%M').alias('file_timestamp'),
         (pl.col('mark_iv') / 100).alias('mark_iv'),
     )

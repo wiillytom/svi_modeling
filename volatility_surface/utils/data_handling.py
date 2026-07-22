@@ -8,10 +8,11 @@ project_root = os.path.abspath(os.path.join(script_dir, '../..'))  # utils -> vo
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-import pandas as pd 
-import numpy as np 
-from scipy.stats import norm 
-from volatility_surface.core.pricing.volatility_dataframe import implied_volatility_dataframe
+import pandas as pd
+import numpy as np
+import polars as pl
+from scipy.stats import norm
+from volatility_surface.core.pricing.volatility_dataframe import implied_volatility_dataframe, add_bid_ask_iv
 
 def clean_df(path: str, filter_rows: bool = True):
     """Cleans the market microstructure data
@@ -82,6 +83,79 @@ def clean_df(path: str, filter_rows: bool = True):
     clean_df['half_spread_iv'] = (clean_df['ask_iv'] - clean_df['bid_iv'])/2
     clean_df['half_spread'] = (clean_df['ask_price'] - clean_df['bid_price'])/2
     return clean_df
+
+
+def clean_df_pl(path: str, filter_rows: bool = True, snapshot_gap_ms: float = 1000.0) -> pl.DataFrame:
+    """Polars port of `clean_df`, for a BULK raw parquet with many snapshots
+    concatenated (e.g. a multi-month 1-min history), not one file per snapshot.
+
+    Snapshot grouping: within one real snapshot, `creation_timestamp_x` jitters
+    by only a few ms across instruments (observed ~10-20ms spread per poll on
+    the raw CSVs); real snapshots are >= 1 minute apart. Rows are sorted by
+    `creation_timestamp_x` and a new snapshot starts whenever the gap since the
+    previous row exceeds `snapshot_gap_ms` (default 1s — well above intra-
+    snapshot jitter, well below any realistic polling interval). Every row in
+    a snapshot is then stamped with that snapshot's min timestamp, replacing
+    the old single-file `ts = df.creation_timestamp_x.iloc[0]` broadcast.
+    Output is sorted by creation_timestamp_x (order is not preserved from the
+    input file).
+    """
+    df = pl.read_parquet(path)
+    if df.is_empty():
+        return df
+
+    df = df.sort('creation_timestamp_x')
+    new_snapshot = pl.col('creation_timestamp_x').diff().fill_null(snapshot_gap_ms + 1) > snapshot_gap_ms
+    df = df.with_columns(new_snapshot.cast(pl.Int64).cum_sum().alias('_snapshot_id'))
+    df = df.with_columns(
+        pl.col('creation_timestamp_x').min().over('_snapshot_id').alias('creation_timestamp_x')
+    )
+
+    if filter_rows:
+        put_boundary = (pl.col('underlying_price') * pl.col('bid_price') < pl.col('strike')) & (pl.col('option_type') == 'P')
+        call_boundary = (pl.col('option_type') == 'C') & (pl.col('bid_price') < 1)
+        df = df.filter(pl.col('volume') > 0).filter(put_boundary | call_boundary)
+
+    df = df.with_columns(
+        (pl.col('expiration_timestamp').str.strptime(pl.Datetime, '%d%b%y') + pl.duration(hours=8)).alias('expiration_timestamp')
+    )
+    df = df.with_columns(
+        pl.col('expiration_timestamp').dt.epoch(time_unit='ms').alias('expiration_timestamp_ms'),
+        pl.from_epoch(pl.col('creation_timestamp_x'), time_unit='ms').dt.strftime('%Y-%m-%d %H:%M').alias('file_timestamp'),
+        (pl.col('mark_iv') / 100).alias('mark_iv'),
+    )
+    df = df.with_columns(
+        ((pl.col('expiration_timestamp_ms') - pl.col('creation_timestamp_x')) / (3.6e6 * 24 * 365)).alias('t'),
+        (pl.col('strike') / pl.col('underlying_price')).log().alias('k'),
+    )
+    df = df.with_columns((pl.col('mark_iv') ** 2 * pl.col('t')).alias('w'))
+    z = -pl.col('k') / pl.col('w').sqrt() + pl.col('w').sqrt() / 2
+    n_d1 = (-(z ** 2) / 2).exp() / np.sqrt(2 * np.pi)  # Gatheral d1 formula, equivalent to classical one
+    df = df.with_columns((n_d1 * pl.col('t').sqrt()).alias('vega'))
+
+    if filter_rows:
+        otm_call = (pl.col('option_type') == 'C') & (pl.col('k') >= 0)
+        otm_put = (pl.col('option_type') == 'P') & (pl.col('k') <= 0)
+        df = df.filter(otm_call | otm_put)
+
+    df = df.drop('_snapshot_id')
+
+    if df.is_empty():
+        df = df.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias('bid_iv'),
+            pl.lit(None, dtype=pl.Float64).alias('ask_iv'),
+        )
+    else:
+        df = add_bid_ask_iv(df)
+
+    if filter_rows:
+        df = df.drop_nulls(subset=['bid_iv', 'ask_iv'])
+
+    df = df.with_columns(
+        ((pl.col('ask_iv') - pl.col('bid_iv')) / 2).alias('half_spread_iv'),
+        ((pl.col('ask_price') - pl.col('bid_price')) / 2).alias('half_spread'),
+    )
+    return df
 
 
 import glob

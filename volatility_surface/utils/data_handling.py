@@ -95,6 +95,13 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
     if df.is_empty():
         return df
 
+    # option_type convention differs by data source: the live gatherer's raw
+    # CSVs use single-letter 'C'/'P'; a bulk historical dump can instead use
+    # full words 'call'/'put' (confirmed on the real Jan-Jun 2025 file). Every
+    # downstream filter/check here compares against 'C'/'P' exactly, so
+    # normalise once up front rather than special-casing each check.
+    df = df.with_columns(pl.col('option_type').str.slice(0, 1).str.to_uppercase().alias('option_type'))
+
     df = df.sort('creation_timestamp_x')
     new_snapshot = pl.col('creation_timestamp_x').diff().fill_null(snapshot_gap_ms + 1) > snapshot_gap_ms
     df = df.with_columns(new_snapshot.cast(pl.Int64).cum_sum().alias('_snapshot_id'))

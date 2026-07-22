@@ -85,22 +85,13 @@ def clean_df(path: str, filter_rows: bool = True):
     return clean_df
 
 
-def clean_df_pl(path: str, filter_rows: bool = True, snapshot_gap_ms: float = 1000.0) -> pl.DataFrame:
-    """Polars port of `clean_df`, for a BULK raw parquet with many snapshots
-    concatenated (e.g. a multi-month 1-min history), not one file per snapshot.
-
-    Snapshot grouping: within one real snapshot, `creation_timestamp_x` jitters
-    by only a few ms across instruments (observed ~10-20ms spread per poll on
-    the raw CSVs); real snapshots are >= 1 minute apart. Rows are sorted by
-    `creation_timestamp_x` and a new snapshot starts whenever the gap since the
-    previous row exceeds `snapshot_gap_ms` (default 1s — well above intra-
-    snapshot jitter, well below any realistic polling interval). Every row in
-    a snapshot is then stamped with that snapshot's min timestamp, replacing
-    the old single-file `ts = df.creation_timestamp_x.iloc[0]` broadcast.
-    Output is sorted by creation_timestamp_x (order is not preserved from the
-    input file).
+def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_ms: float = 1000.0) -> pl.DataFrame:
+    """Shared transform behind `clean_df_pl` (whole file in memory) and
+    `clean_bulk_parquet_chunked` (day-by-day, for files too big to hold in RAM
+    along with the IV solver's working arrays). See `clean_df_pl` for the
+    snapshot-grouping rationale — kept here so both callers share one
+    implementation instead of drifting apart.
     """
-    df = pl.read_parquet(path)
     if df.is_empty():
         return df
 
@@ -156,6 +147,85 @@ def clean_df_pl(path: str, filter_rows: bool = True, snapshot_gap_ms: float = 10
         ((pl.col('ask_price') - pl.col('bid_price')) / 2).alias('half_spread'),
     )
     return df
+
+
+def clean_df_pl(path: str, filter_rows: bool = True, snapshot_gap_ms: float = 1000.0) -> pl.DataFrame:
+    """Polars port of `clean_df`, for a BULK raw parquet with many snapshots
+    concatenated (e.g. a multi-month 1-min history), not one file per snapshot.
+
+    Snapshot grouping: within one real snapshot, `creation_timestamp_x` jitters
+    by only a few ms across instruments (observed ~10-20ms spread per poll on
+    the raw CSVs); real snapshots are >= 1 minute apart. Rows are sorted by
+    `creation_timestamp_x` and a new snapshot starts whenever the gap since the
+    previous row exceeds `snapshot_gap_ms` (default 1s — well above intra-
+    snapshot jitter, well below any realistic polling interval). Every row in
+    a snapshot is then stamped with that snapshot's min timestamp, replacing
+    the old single-file `ts = df.creation_timestamp_x.iloc[0]` broadcast.
+    Output is sorted by creation_timestamp_x (order is not preserved from the
+    input file).
+
+    Loads the ENTIRE file into memory plus the IV solver's numpy working
+    arrays — fine for a file of up to a few million rows, but for a much
+    larger bulk dump (tens/hundreds of millions of rows) this can exceed
+    available RAM and crash the process with no Python-catchable error (an OS
+    OOM kill, not an exception). Use `clean_bulk_parquet_chunked` instead for
+    files that large.
+    """
+    return _clean_df_pl_core(pl.read_parquet(path), filter_rows=filter_rows, snapshot_gap_ms=snapshot_gap_ms)
+
+
+def clean_bulk_parquet_chunked(path: str, out_dir: str, filter_rows: bool = True,
+                                snapshot_gap_ms: float = 1000.0, chunk_days: float = 1.0) -> None:
+    """Same cleaning as `clean_df_pl`, but for a raw parquet too large to fit
+    in memory alongside the IV solver's working arrays all at once (this is
+    what a ~96M-row, 6-month 1-min dump needs — `clean_df_pl` OOM-crashes the
+    kernel on that scale, silently, since an OS memory kill isn't a Python
+    exception).
+
+    Slices the file into `chunk_days`-sized windows of `creation_timestamp_x`
+    (using polars' lazy scanner, so only each window's rows are ever
+    materialised — not the whole file), cleans each window with the same
+    `_clean_df_pl_core` logic `clean_df_pl` uses, and writes one output
+    parquet per non-empty chunk into `out_dir`. Read the result back as one
+    logical dataset (still lazily, no need to hold it all in memory) with:
+
+        pl.scan_parquet(f"{out_dir}/*.parquet")
+
+    Caveat: a real snapshot landing exactly on a chunk boundary (e.g. a poll
+    at 23:59:59.99x ms) could be split across two chunks and end up counted as
+    two partial snapshots instead of one. This is rare (at most one snapshot
+    per chunk boundary — ~1 in 1440 for chunk_days=1 at 1-min frequency) and
+    is not corrected for. If you need it exact, either shrink chunk_days or
+    post-process rows near each boundary.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    lf = pl.scan_parquet(path)
+    bounds = lf.select(
+        pl.col('creation_timestamp_x').min().alias('lo'),
+        pl.col('creation_timestamp_x').max().alias('hi'),
+    ).collect()
+    if bounds.is_empty() or bounds['lo'][0] is None:
+        return
+    lo_ms, hi_ms = int(bounds['lo'][0]), int(bounds['hi'][0])
+    window_ms = int(chunk_days * 24 * 3600 * 1000)
+
+    start = lo_ms
+    chunk_idx = 0
+    while start <= hi_ms:
+        end = start + window_ms
+        chunk = lf.filter(
+            (pl.col('creation_timestamp_x') >= start) & (pl.col('creation_timestamp_x') < end)
+        ).collect()
+        if not chunk.is_empty():
+            cleaned = _clean_df_pl_core(chunk, filter_rows=filter_rows, snapshot_gap_ms=snapshot_gap_ms)
+            if not cleaned.is_empty():
+                out_path = os.path.join(out_dir, f'chunk_{chunk_idx:05d}.parquet')
+                cleaned.write_parquet(out_path)
+                print(f'chunk {chunk_idx}: {chunk.height} raw rows -> {cleaned.height} cleaned rows -> {out_path}')
+            else:
+                print(f'chunk {chunk_idx}: {chunk.height} raw rows -> 0 cleaned rows, skipped')
+        chunk_idx += 1
+        start = end
 
 
 import glob

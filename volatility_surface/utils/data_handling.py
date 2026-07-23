@@ -13,6 +13,7 @@ import numpy as np
 import polars as pl
 from scipy.stats import norm
 from volatility_surface.core.pricing.volatility_dataframe import implied_volatility_dataframe, add_bid_ask_iv
+from volatility_surface.core.pricing.pricing_models import bs_delta, bs_inverse_delta
 
 def clean_df(path: str, filter_rows: bool = True):
     """Cleans the market microstructure data
@@ -162,6 +163,22 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
     z = -pl.col('k') / pl.col('w').sqrt() + pl.col('w').sqrt() / 2
     n_d1 = (-(z ** 2) / 2).exp() / np.sqrt(2 * np.pi)  # Gatheral d1 formula, equivalent to classical one
     df = df.with_columns((n_d1 * pl.col('t').sqrt()).alias('vega'))
+
+    # Delta, from mark_iv ("Blacks delta", no skew adjustment — matches
+    # Deribit's own convention). Two columns: `delta` is the regular
+    # (dollar/USD) Black-Scholes delta; `inverse_delta` is the premium-adjusted
+    # hedge ratio actually needed to delta-hedge a Deribit inverse (coin-
+    # settled) option with the perpetual — Delta_tilde = Delta - V/S, Lucic &
+    # Sepp (2024, SSRN 4606748), Corollary 1. Plain `delta` is the WRONG hedge
+    # ratio for these contracts; `inverse_delta` is the one to actually trade.
+    K_norm = (df['strike'] / df['underlying_price']).to_numpy()
+    t_arr = df['t'].to_numpy()
+    sigma_arr = df['mark_iv'].to_numpy()
+    opt_arr = df['option_type'].to_numpy()
+    df = df.with_columns(
+        pl.Series('delta', bs_delta(1.0, K_norm, t_arr, 0.0, sigma_arr, opt_arr)),
+        pl.Series('inverse_delta', bs_inverse_delta(1.0, K_norm, t_arr, 0.0, sigma_arr, opt_arr)),
+    )
 
     if filter_rows:
         otm_call = (pl.col('option_type') == 'C') & (pl.col('k') >= 0)

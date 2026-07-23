@@ -86,12 +86,26 @@ def clean_df(path: str, filter_rows: bool = True):
     return clean_df
 
 
-def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_ms: float = 1000.0) -> pl.DataFrame:
+def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_ms: float = 1000.0,
+                       otm_only: bool = True) -> pl.DataFrame:
     """Shared transform behind `clean_df_pl` (whole file in memory) and
     `clean_bulk_parquet_chunked` (day-by-day, for files too big to hold in RAM
     along with the IV solver's working arrays). See `clean_df_pl` for the
     snapshot-grouping rationale — kept here so both callers share one
     implementation instead of drifting apart.
+
+    `filter_rows` and `otm_only` are independent — a row-quality filter
+    (volume>0, no-arb boundary sanity, drop failed IV solves) and a moneyness
+    filter (OTM-only) respectively. They used to be one combined flag, which
+    is right for building a calibration-ready dataset (vol surface fitting is
+    conventionally OTM-only — ITM options are redundant with OTM ones via
+    put-call parity, and are typically thinner/quirkier quotes) but wrong for
+    a trading/signal universe: a red-cell / arbitrage screen needs to see ITM
+    quotes too, since a put-call-parity violation on an ITM option IS a
+    tradeable signal the calibration-only view would silently discard. Use
+    `filter_rows=True, otm_only=False` for that "global" dataframe, and
+    `otm_only=True` (default, matches the original behaviour) when the output
+    feeds calibration.
     """
     if df.is_empty():
         return df
@@ -180,7 +194,7 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
         pl.Series('inverse_delta', bs_inverse_delta(1.0, K_norm, t_arr, 0.0, sigma_arr, opt_arr)),
     )
 
-    if filter_rows:
+    if otm_only:
         otm_call = (pl.col('option_type') == 'C') & (pl.col('k') >= 0)
         otm_put = (pl.col('option_type') == 'P') & (pl.col('k') <= 0)
         df = df.filter(otm_call | otm_put)
@@ -205,7 +219,8 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
     return df
 
 
-def clean_df_pl(path: str, filter_rows: bool = True, snapshot_gap_ms: float = 1000.0) -> pl.DataFrame:
+def clean_df_pl(path: str, filter_rows: bool = True, snapshot_gap_ms: float = 1000.0,
+                 otm_only: bool = True) -> pl.DataFrame:
     """Polars port of `clean_df`, for a BULK raw parquet with many snapshots
     concatenated (e.g. a multi-month 1-min history), not one file per snapshot.
 
@@ -220,6 +235,11 @@ def clean_df_pl(path: str, filter_rows: bool = True, snapshot_gap_ms: float = 10
     Output is sorted by creation_timestamp_x (order is not preserved from the
     input file).
 
+    `otm_only=True` (default) matches `clean_df`'s original calibration-ready
+    behaviour (OTM options only). Pass `otm_only=False` for the full universe
+    (ITM included) needed by a trading/signal screen — see `_clean_df_pl_core`
+    docstring for why these two use cases need different filtering.
+
     Loads the ENTIRE file into memory plus the IV solver's numpy working
     arrays — fine for a file of up to a few million rows, but for a much
     larger bulk dump (tens/hundreds of millions of rows) this can exceed
@@ -227,11 +247,13 @@ def clean_df_pl(path: str, filter_rows: bool = True, snapshot_gap_ms: float = 10
     OOM kill, not an exception). Use `clean_bulk_parquet_chunked` instead for
     files that large.
     """
-    return _clean_df_pl_core(pl.read_parquet(path), filter_rows=filter_rows, snapshot_gap_ms=snapshot_gap_ms)
+    return _clean_df_pl_core(pl.read_parquet(path), filter_rows=filter_rows,
+                              snapshot_gap_ms=snapshot_gap_ms, otm_only=otm_only)
 
 
 def clean_bulk_parquet_chunked(path: str, out_dir: str, filter_rows: bool = True,
-                                snapshot_gap_ms: float = 1000.0, chunk_days: float = 1.0) -> None:
+                                snapshot_gap_ms: float = 1000.0, chunk_days: float = 1.0,
+                                otm_only: bool = True) -> None:
     """Same cleaning as `clean_df_pl`, but for a raw parquet too large to fit
     in memory alongside the IV solver's working arrays all at once (this is
     what a ~96M-row, 6-month 1-min dump needs — `clean_df_pl` OOM-crashes the
@@ -273,7 +295,7 @@ def clean_bulk_parquet_chunked(path: str, out_dir: str, filter_rows: bool = True
             (pl.col('creation_timestamp_x') >= start) & (pl.col('creation_timestamp_x') < end)
         ).collect()
         if not chunk.is_empty():
-            cleaned = _clean_df_pl_core(chunk, filter_rows=filter_rows, snapshot_gap_ms=snapshot_gap_ms)
+            cleaned = _clean_df_pl_core(chunk, filter_rows=filter_rows, snapshot_gap_ms=snapshot_gap_ms, otm_only=otm_only)
             if not cleaned.is_empty():
                 out_path = os.path.join(out_dir, f'chunk_{chunk_idx:05d}.parquet')
                 cleaned.write_parquet(out_path)

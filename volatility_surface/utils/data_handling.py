@@ -114,26 +114,46 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
         call_boundary = (pl.col('option_type') == 'C') & (pl.col('bid_price') < 1)
         df = df.filter(pl.col('volume') > 0).filter(put_boundary | call_boundary)
 
-    # Two schemas seen in the wild: the live gatherer's raw CSVs store a bare
-    # expiry DATE string ("5JUN26", no time-of-day — Deribit settles at 08:00
-    # UTC, so +8h is added after parsing to get the real settlement instant).
-    # A bulk historical dump can instead already carry a fully-resolved
-    # epoch-ms int (settlement time baked in — confirmed by decoding a sample:
-    # 1738569600000 -> 2025-02-03 08:00:00 UTC, exactly midnight+8h). Adding
-    # +8h to that would double-count the offset, so detect and branch instead
-    # of assuming the string format unconditionally.
-    if df.schema['expiration_timestamp'] == pl.Utf8:
+    # Three schemas seen in the wild for `expiration_timestamp`:
+    #   1. bare expiry DATE string, live gatherer's raw CSVs ("5JUN26", no
+    #      time-of-day — Deribit settles at 08:00 UTC, so +8h is added after
+    #      parsing to get the real settlement instant).
+    #   2. already-resolved epoch-ms int, a bulk historical dump (settlement
+    #      time baked in already — confirmed by decoding a sample:
+    #      1738569600000 -> 2025-02-03 08:00:00 UTC, exactly midnight+8h).
+    #      Adding +8h to that would double-count the offset.
+    #   3. a native Datetime column (e.g. `live_btc.parquet`, which carries a
+    #      Datetime(time_unit='ns') column — inherited from a pandas
+    #      datetime64[ns] upstream). MUST use `.dt.epoch()`, not `.cast(Int64)`
+    #      — casting a Datetime directly reads out whatever its internal time
+    #      unit is (here: nanoseconds), which is 1e6x too large if you assume
+    #      milliseconds. This produced t values around 5.7e7 "years" instead
+    #      of a sane fraction when first hit on real data.
+    dtype = df.schema['expiration_timestamp']
+    if dtype == pl.Utf8:
         df = df.with_columns(
             (pl.col('expiration_timestamp').str.strptime(pl.Datetime, '%d%b%y') + pl.duration(hours=8)).alias('expiration_timestamp')
         )
         df = df.with_columns(pl.col('expiration_timestamp').dt.epoch(time_unit='ms').alias('expiration_timestamp_ms'))
+    elif dtype == pl.Datetime:
+        df = df.with_columns(pl.col('expiration_timestamp').dt.epoch(time_unit='ms').alias('expiration_timestamp_ms'))
     else:
         df = df.with_columns(pl.col('expiration_timestamp').cast(pl.Int64).alias('expiration_timestamp_ms'))
 
+    # mark_iv convention also differs by source: the live gatherer's raw CSVs
+    # carry Deribit's raw PERCENTAGE value (e.g. 47.32 for 47.32% vol), needing
+    # /100 to get decimal — but an already-processed file (e.g. live_btc.parquet)
+    # can carry it already in decimal (0.30-0.85 range here). Dividing that by
+    # 100 again silently produced a w off by exactly 1e4 (mark_iv appears
+    # squared in w = mark_iv**2 * t). Crypto vol realistically never exceeds
+    # ~10 (1000%) in decimal form, so median > 10 is an unambiguous signal
+    # it's still in percentage form and needs the /100.
+    mark_iv_median = df.select(pl.col('mark_iv').median()).item()
     df = df.with_columns(
         pl.from_epoch(pl.col('creation_timestamp_x'), time_unit='ms').dt.strftime('%Y-%m-%d %H:%M').alias('file_timestamp'),
-        (pl.col('mark_iv') / 100).alias('mark_iv'),
     )
+    if mark_iv_median > 10:
+        df = df.with_columns((pl.col('mark_iv') / 100).alias('mark_iv'))
     df = df.with_columns(
         ((pl.col('expiration_timestamp_ms') - pl.col('creation_timestamp_x')) / (3.6e6 * 24 * 365)).alias('t'),
         (pl.col('strike') / pl.col('underlying_price')).log().alias('k'),

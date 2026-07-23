@@ -8,14 +8,25 @@
 #   pip install -r requirements.txt
 
 # Scientific stack
-numpy==1.26.4
+numpy==2.3.5             # bumped from 1.26.4 (2026-07-22) chasing py_vollib_vectorized; that
+                         # package turned out to be a dead end (see below) but nothing broke
+                         # under 2.x — re-run empirical smoke checks before trusting this on a
+                         # result that mattered before the bump.
 pandas==2.3.3
 scipy==1.17.1
 matplotlib==3.10.9
 pyarrow==24.0.0          # parquet read/write
+polars[rtcompat]==1.43.0 # rtcompat build: avoids AVX2/FMA crash on this Mac's CPU
 
 # Quant
-vollib==1.0.8            # Black / Black-Scholes IV inversion
+vollib==1.0.11           # Black / Black-Scholes IV inversion (Peter Jaeckel's "Let's Be
+                         # Rational" under the hood, via its lets-be-rational dependency).
+                         # Bumped from 1.0.8 alongside numpy. Do NOT also install py_vollib /
+                         # py_vollib_vectorized / py-lets-be-rational — those are a DIFFERENT,
+                         # unmaintained package family that ships an identically-named
+                         # lets_be_rational module and silently corrupts this one via file
+                         # collision on install/uninstall. py_vollib_vectorized is additionally
+                         # broken outright under any numba new enough to support Python 3.12.
 
 # Live pipeline + UI
 streamlit==1.58.0

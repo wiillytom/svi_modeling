@@ -70,6 +70,41 @@ def gk_price(S, K, T, r, q, sigma, option_type='c'):
                   - np.asarray(K) * disc_K * norm.cdf(eta * d2))
 
 
+def gk_delta(S, K, T, r, q, sigma, option_type='c'):
+    """Delta = dPrice/dS, the REGULAR (dollar/USD) delta — eta * exp(-q*T) * N(eta*d1).
+
+    This is NOT the hedge ratio to use for a Deribit inverse (coin-settled)
+    option — see `inverse_delta` for that. Kept separate because the regular
+    delta is what Lucic & Sepp (2024, SSRN 4606748) call Delta(t,S,.) in their
+    Corollary 1, the input to the premium-adjusted inverse delta.
+    """
+    d1, _ = _d1_d2(S, K, T, r, q, sigma)
+    eta = _call_put_sign(option_type)
+    return eta * np.exp(-np.asarray(q) * np.asarray(T)) * norm.cdf(eta * d1)
+
+
+def inverse_delta(S, K, T, r, q, sigma, option_type='c'):
+    """Hedge ratio (in units of the underlying inverse perpetual/future) for a
+    Deribit-style inverse option — Lucic & Sepp (2024, SSRN 4606748), Corollary 1:
+
+        Delta_tilde(t,S,.) = Delta(t,S,.) - V(t,S,.)/S
+
+    Deribit options are coin-settled (quoted/settled in BTC or ETH, not USD),
+    which changes the martingale numeraire from cash to the underlying and
+    requires this premium adjustment — the plain Black-Scholes delta alone is
+    the WRONG hedge ratio for an inverse option (Section 2.1/Corollary 1 of the
+    paper). No skew adjustment is applied (matches Deribit's own convention,
+    footnote 8 of the paper — "Blacks delta").
+
+    S, K here follow this project's normalised convention (S=1, K=strike/spot),
+    under which V(t,S,.)/S is exactly `gk_price(1, K_norm, ...)` — the
+    coin-denominated price already matching bid_price/ask_price/mid_price.
+    """
+    delta = gk_delta(S, K, T, r, q, sigma, option_type)
+    price = gk_price(S, K, T, r, q, sigma, option_type)
+    return delta - price / np.asarray(S)
+
+
 def gk_vega(S, K, T, r, q, sigma):
     """Vega = dPrice/dSigma. Same for call and put."""
     d1, _ = _d1_d2(S, K, T, r, q, sigma)
@@ -220,6 +255,14 @@ def gk_implied_vol(price, S, K, T, r, q, option_type='c',
 def bs_price(S, K, T, r, sigma, option_type='c'):
     """Black-Scholes European option price (no dividend/funding yield)."""
     return gk_price(S, K, T, r, 0.0, sigma, option_type)
+
+
+def bs_delta(S, K, T, r, sigma, option_type='c'):
+    return gk_delta(S, K, T, r, 0.0, sigma, option_type)
+
+
+def bs_inverse_delta(S, K, T, r, sigma, option_type='c'):
+    return inverse_delta(S, K, T, r, 0.0, sigma, option_type)
 
 
 def bs_vega(S, K, T, r, sigma):

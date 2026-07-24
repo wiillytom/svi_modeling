@@ -51,11 +51,23 @@ def _perp_price_at(perp_ts: np.ndarray, perp_close: np.ndarray, ts_ms: int) -> f
 
 
 def _iter_snapshots(chunk_dir: str, max_chunks: int | None = None):
-    """Yield (file_timestamp, snapshot_df) across every chunk parquet in
+    """Yield (creation_timestamp_x, snapshot_df) across every chunk parquet in
     `chunk_dir`, in chronological order. Chunk files are named
     chunk_00000.parquet, chunk_00001.parquet, ... in day order
     (`clean_bulk_parquet_chunked`), so sorting filenames preserves global
     chronology; within a chunk, groupby+sort_values orders snapshots too.
+
+    Groups by `creation_timestamp_x` (the true snapshot key established by
+    `_clean_df_pl_core`'s own snapshot-detection, ms precision), NOT by
+    `file_timestamp` — that column is a minute-TRUNCATED display string, and
+    on any source polled faster than once/minute (confirmed on the live
+    gatherer's output: 24 genuinely distinct snapshots ~1.5-3s apart all
+    truncating to the same "HH:MM" string) grouping by it silently merges
+    many real snapshots into one Frankenstein "snapshot" — wrong (conflates
+    different points in time into a single calibration) and the actual
+    reason a single calibration call was taking ~100s instead of a fraction
+    of a second (264 fake expiry-slices from 24 merged real ones, instead of
+    the true ~20-30).
 
     `max_chunks` limits how many chunk FILES (not snapshots) are read — pass
     1 to try the engine on a single day before committing to a full run."""
@@ -66,7 +78,7 @@ def _iter_snapshots(chunk_dir: str, max_chunks: int | None = None):
         day_df = pl.read_parquet(path).to_pandas()
         if day_df.empty:
             continue
-        for ts, snap in day_df.groupby("file_timestamp", sort=True):
+        for ts, snap in day_df.groupby("creation_timestamp_x", sort=True):
             # Defensive: some sources (observed on the live gatherer's output)
             # duplicate every row within a snapshot verbatim, which breaks the
             # instrument_id-indexed lookups below (`.loc[inst_id]` returning a
@@ -143,6 +155,23 @@ def run_backtest(chunk_dir: str, perp_path: str,
         flagged = flagged.set_index("instrument_id", drop=False)
         red = flagged[flagged["red_cell"]]
 
+        # Precompute the single best (max edge*vega) candidate per slot ONCE
+        # per snapshot — used by both the exits/rotation pass and the entries
+        # pass below via an O(1) dict lookup. The previous version re-filtered
+        # the whole `red` table with a pandas boolean mask for EVERY open
+        # position, every snapshot (O(positions x red_cells) pandas ops) —
+        # the dominant cost of a 21-minutes-for-one-day run. This also
+        # unifies what used to be two slightly different edge formulas (one
+        # in the exits pass, one in entries) into one.
+        slot_best: dict[tuple, pd.Series] = {}
+        if not red.empty:
+            red = red.copy()
+            red["_slot"] = list(zip(red["strike"].astype(float), red["expiration_timestamp_ms"].astype(float)))
+            touch = np.where(red["signal_side"] == "buy", red["ask_price"], red["bid_price"])
+            red["_edge"] = (red["theo_price"] - touch).abs() * red["vega"]
+            best_idx = red.groupby("_slot")["_edge"].idxmax()
+            slot_best = {slot: red.loc[idx] for slot, idx in best_idx.items()}
+
         F_perp = _perp_price_at(perp_ts, perp_close, ts_ms)
 
         # ---- 3. exits: null-out, then rotation ----
@@ -159,42 +188,29 @@ def run_backtest(chunk_dir: str, perp_path: str,
                 del slot_owner[pos["slot"]]
                 continue
 
-            # rotation: is there a strictly-better candidate at the same slot?
-            slot = pos["slot"]
-            candidates = red[(red["strike"] == slot[0]) & (red["expiration_timestamp_ms"] == slot[1])]
-            candidates = candidates[candidates["instrument_id"] != inst_id]
-            if candidates.empty:
-                continue
-            cand_touch = np.where(candidates["signal_side"] == "buy", candidates["ask_price"], candidates["bid_price"])
-            cand_edge = (candidates["theo_price"] - cand_touch).abs() * candidates["vega"]
-            best_idx = cand_edge.idxmax()
-            best_edge = float(cand_edge.loc[best_idx])
-            own_edge = abs(float(row["theo_price"]) - float(row["bid_price"] if pos["side"] == "sell" else row["ask_price"])) * float(row["vega"])
-            if best_edge > own_edge:
+            # rotation: slot_best[slot] is the argmax over ALL red rows at
+            # this slot, including this position's own — if it's someone
+            # else, that candidate has strictly higher edge*vega.
+            best_row = slot_best.get(pos["slot"])
+            if best_row is not None and best_row["instrument_id"] != inst_id:
                 _close_position(pos, row, "rotation", events)
                 del positions[inst_id]
-                del slot_owner[slot]
-                # the dominating candidate is still in `red` and not yet in `positions` -> picked up by the entry pass below
+                del slot_owner[pos["slot"]]
+                # the winning candidate is `best_row`, picked up by the entries pass below
 
-        # ---- 4. entries: for every slot not currently owned, take the single
-        # best red-flagged candidate at that slot (by edge*vega) — NOT just
-        # the first one encountered. Matters even on a slot freed by rotation
-        # THIS same snapshot: the instrument just rotated out of is often
-        # still individually red (that's not why it was rotated out — a
-        # better candidate was), so grabbing an arbitrary red row for a freed
-        # slot can immediately re-enter the very position rotation just
-        # closed. Also guards against entering both a call and a put at the
-        # same strike+expiry if both happen to be red at once (rotation scope
-        # is one position per slot regardless of type). ----
-        if not red.empty:
-            red = red.copy()
-            red["_slot"] = list(zip(red["strike"].astype(float), red["expiration_timestamp_ms"].astype(float)))
-            touch = np.where(red["signal_side"] == "buy", red["ask_price"], red["bid_price"])
-            red["_edge"] = (red["theo_price"] - touch).abs() * red["vega"]
-        for slot, group in (red.groupby("_slot") if not red.empty else []):
+        # ---- 4. entries: for every slot not currently owned, take its
+        # precomputed best candidate. Matters even on a slot freed by
+        # rotation THIS same snapshot: the instrument just rotated out of is
+        # often still individually red (that's not why it was rotated out —
+        # a better candidate was), so grabbing an arbitrary red row for a
+        # freed slot can immediately re-enter the very position rotation just
+        # closed — `slot_best` is guaranteed to be the actual winner. Also
+        # guards against entering both a call and a put at the same
+        # strike+expiry if both happen to be red at once (rotation scope is
+        # one position per slot regardless of type). ----
+        for slot, row in slot_best.items():
             if slot in slot_owner:
                 continue
-            row = group.loc[group["_edge"].idxmax()]
             inst_id = row["instrument_id"]
             vega = float(row["vega"])
             if not np.isfinite(vega) or vega <= 0:
@@ -262,7 +278,8 @@ def run_backtest(chunk_dir: str, perp_path: str,
             last_hedge_hour = hour
 
         if verbose and n_snapshots % 500 == 0:
-            print(f"[{n_snapshots}] {ts} — {len(positions)} open positions, {len(events)} events so far")
+            label = snap["file_timestamp"].iloc[0] if "file_timestamp" in snap.columns else ts
+            print(f"[{n_snapshots}] {label} — {len(positions)} open positions, {len(events)} events so far")
 
     # ---- 6. fallback: settle any still-open positions at the last known price (intrinsic if truly past expiry) ----
     for inst_id, pos in positions.items():

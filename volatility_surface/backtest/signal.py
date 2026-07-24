@@ -40,7 +40,7 @@ def bs_pricing(F, K, T, iv, is_call):
     return price, delta, gamma, vega, theta
 
 
-def detect_red_cells(df: pd.DataFrame, calib_result: dict, dp: int = 4) -> pd.DataFrame:
+def detect_red_cells(df: pd.DataFrame, calib_result: dict, dp: int = 4, invert: bool = False) -> pd.DataFrame:
     """Flag each row of a single-snapshot option dataframe as a "red cell":
     the calibrated model's re-priced Black-76 coin price falls outside the
     row's own [bid_price, ask_price] at `dp`-decimal precision. Same
@@ -64,6 +64,11 @@ def detect_red_cells(df: pd.DataFrame, calib_result: dict, dp: int = 4) -> pd.Da
     Rows with NaN/non-positive bid_price or ask_price are excluded from
     red_cell (never flagged) — synthetic/missing quotes, not real tradeable
     prices (same exclusion as the live screen's `fake_C`/`fake_P` masks).
+
+    `invert=True` flags exactly the same cells but swaps buy<->sell — for
+    testing whether the strategy's direction, not its transaction costs, is
+    what's driving P&L. Note this does NOT flip transaction costs (spread-
+    crossing and fees are paid regardless of side), only the directional bet.
     """
     model = calib_result["_model"]
     expiries = np.asarray(calib_result["expiries"], dtype=float)
@@ -98,7 +103,10 @@ def detect_red_cells(df: pd.DataFrame, calib_result: dict, dp: int = 4) -> pd.Da
     rich = (~fake) & (theo_r < bid_r)    # model says it's worth less than the bid -> sell
 
     df["red_cell"] = cheap | rich
-    df["signal_side"] = np.where(cheap, "buy", np.where(rich, "sell", None))
+    if invert:
+        df["signal_side"] = np.where(cheap, "sell", np.where(rich, "buy", None))
+    else:
+        df["signal_side"] = np.where(cheap, "buy", np.where(rich, "sell", None))
     return df
 
 

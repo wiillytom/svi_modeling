@@ -131,6 +131,7 @@ def run_backtest(chunk_dir: str, perp_path: str,
                   full_calib_interval_ms: int = FULL_CALIB_INTERVAL_MS,
                   max_chunks: int | None = None,
                   verbose: bool = True,
+                  invert_signal: bool = False,
                   live_plot_pnl: bool = False,
                   live_plot_interval_secs: float = 3.0) -> list[dict]:
     """Run the backtest over every snapshot in `chunk_dir`'s cleaned chunk
@@ -140,6 +141,13 @@ def run_backtest(chunk_dir: str, perp_path: str,
     `max_chunks`: limit to the first N chunk files (= N days, one chunk per
     day from `clean_bulk_parquet_chunked`) instead of the whole directory —
     pass 1 to time a single day before committing to the full range.
+
+    `invert_signal`: flag exactly the same red cells but take the OPPOSITE
+    side (sell what looked cheap, buy what looked rich) — a diagnostic for
+    whether the strategy's direction, rather than its transaction costs, is
+    what's driving P&L. Does NOT flip transaction costs (spread-crossing and
+    fees are paid regardless of side) or the delta hedge (still hedges
+    whatever position is actually held), only the entry/exit direction.
 
     `live_plot_pnl`: redraw a cumulative-P&L chart in the notebook cell every
     `live_plot_interval_secs` (see `live_plot.LivePnLPlot`) — a static
@@ -200,7 +208,7 @@ def run_backtest(chunk_dir: str, perp_path: str,
         last_calib_result = result
 
         # ---- 2. signal ----
-        flagged = detect_red_cells(snap, result)
+        flagged = detect_red_cells(snap, result, invert=invert_signal)
         flagged = flagged.set_index("instrument_id", drop=False)
         red = flagged[flagged["red_cell"]]
 

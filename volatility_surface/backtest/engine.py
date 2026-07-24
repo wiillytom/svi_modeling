@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import glob
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,7 @@ from volatility_surface.core.calibration.calibrator import (
 )
 from volatility_surface.models.vol_models import eSSVI
 from volatility_surface.backtest.signal import detect_red_cells, implied_carry_rate
+from volatility_surface.backtest import live_plot
 
 
 FULL_CALIB_INTERVAL_MS = 15 * 60 * 1000   # full eSSVI recalibration cadence
@@ -50,7 +52,14 @@ def _perp_price_at(perp_ts: np.ndarray, perp_close: np.ndarray, ts_ms: int) -> f
     return float(perp_close[idx])
 
 
-def _iter_snapshots(chunk_dir: str, max_chunks: int | None = None):
+def _progress_bar(current: int, total: int, width: int = 30) -> str:
+    frac = current / total if total else 1.0
+    filled = int(width * frac)
+    bar = "#" * filled + "-" * (width - filled)
+    return f"[{bar}] {current}/{total} ({frac * 100:5.1f}%)"
+
+
+def _iter_snapshots(chunk_dir: str, max_chunks: int | None = None, progress: bool = False):
     """Yield (creation_timestamp_x, snapshot_df) across every chunk parquet in
     `chunk_dir`, in chronological order. Chunk files are named
     chunk_00000.parquet, chunk_00001.parquet, ... in day order
@@ -70,22 +79,39 @@ def _iter_snapshots(chunk_dir: str, max_chunks: int | None = None):
     the true ~20-30).
 
     `max_chunks` limits how many chunk FILES (not snapshots) are read — pass
-    1 to try the engine on a single day before committing to a full run."""
+    1 to try the engine on a single day before committing to a full run.
+
+    `progress`: if True, prints a live, in-place progress bar over snapshots
+    within the current day (throttled to ~5 updates/sec so it doesn't add
+    meaningful overhead of its own) — separate from `run_backtest`'s own
+    periodic "[N] ... open positions" line, which reports on the run overall
+    rather than position within the current day."""
     paths = sorted(glob.glob(os.path.join(chunk_dir, "chunk_*.parquet")))
     if max_chunks is not None:
         paths = paths[:max_chunks]
-    for path in paths:
+    n_days = len(paths)
+    for day_idx, path in enumerate(paths):
         day_df = pl.read_parquet(path).to_pandas()
         if day_df.empty:
             continue
-        for ts, snap in day_df.groupby("creation_timestamp_x", sort=True):
+        n_snaps = day_df["creation_timestamp_x"].nunique()
+        last_print = 0.0
+        for i, (ts, snap) in enumerate(day_df.groupby("creation_timestamp_x", sort=True)):
             # Defensive: some sources (observed on the live gatherer's output)
             # duplicate every row within a snapshot verbatim, which breaks the
             # instrument_id-indexed lookups below (`.loc[inst_id]` returning a
             # DataFrame instead of a Series). One row per instrument per
             # snapshot is always correct regardless of the source.
             snap = snap.drop_duplicates(subset="instrument_id", keep="first")
+            if progress:
+                now = time.time()
+                if now - last_print > 0.2 or i == n_snaps - 1:
+                    bar = _progress_bar(i + 1, n_snaps)
+                    print(f"\rDay {day_idx + 1}/{n_days} {os.path.basename(path)} {bar}", end="", flush=True)
+                    last_print = now
             yield ts, snap.reset_index(drop=True)
+        if progress:
+            print()  # newline so the next day's bar (or later prints) start fresh
 
 
 def _slot_key(row) -> tuple:
@@ -104,7 +130,9 @@ def run_backtest(chunk_dir: str, perp_path: str,
                   target_vega_dollars: float = TARGET_VEGA_DOLLARS,
                   full_calib_interval_ms: int = FULL_CALIB_INTERVAL_MS,
                   max_chunks: int | None = None,
-                  verbose: bool = True) -> list[dict]:
+                  verbose: bool = True,
+                  live_plot_pnl: bool = False,
+                  live_plot_interval_secs: float = 3.0) -> list[dict]:
     """Run the backtest over every snapshot in `chunk_dir`'s cleaned chunk
     parquets (must have been produced with `otm_only=False` — the strategy
     needs the full ITM+OTM universe, not just the calibration-ready OTM one).
@@ -113,12 +141,25 @@ def run_backtest(chunk_dir: str, perp_path: str,
     day from `clean_bulk_parquet_chunked`) instead of the whole directory —
     pass 1 to time a single day before committing to the full range.
 
+    `live_plot_pnl`: redraw a cumulative-P&L chart in the notebook cell every
+    `live_plot_interval_secs` (see `live_plot.LivePnLPlot`) — a static
+    matplotlib figure redrawn via `IPython.display.clear_output`, not an
+    interactive widget. Requires an IPython/Jupyter environment; silently
+    disabled (with one warning) outside of one. When on, this also takes over
+    the text progress bar's job (`_iter_snapshots`'s bar would otherwise be
+    wiped by `clear_output` on every redraw), so only one of the two shows.
+
     Returns a list of event dicts (one per entry/exit) — hand this to
     `results.py` for aggregation. Each event has: instrument_id, strike,
     option_type, side, action ('entry'/'exit'), reason (for exits: 'null',
     'rotation', 'expiry'), timestamp, price, contracts, option_pnl (for
     exits), option_cost, and running hedge state at that point.
     """
+    if live_plot_pnl and not live_plot.is_available():
+        print("live_plot_pnl=True but IPython/matplotlib aren't available — ignoring (need a Jupyter environment).")
+        live_plot_pnl = False
+    plotter = live_plot.LivePnLPlot(interval_secs=live_plot_interval_secs) if live_plot_pnl else None
+
     perp_df = _load_perp_series(perp_path)
     perp_ts = perp_df["timestamp_ms"].to_numpy()
     perp_close = perp_df["close"].to_numpy()
@@ -137,13 +178,21 @@ def run_backtest(chunk_dir: str, perp_path: str,
     events: list[dict] = []
     n_snapshots = 0
 
-    for ts, snap in _iter_snapshots(chunk_dir, max_chunks=max_chunks):
+    for ts, snap in _iter_snapshots(chunk_dir, max_chunks=max_chunks, progress=verbose and not live_plot_pnl):
         n_snapshots += 1
         ts_ms = int(snap["creation_timestamp_x"].iloc[0])
 
         # ---- 1. calibration (full every full_calib_interval_ms, theta_only warm-start otherwise) ----
         if last_calib_result is None or (ts_ms - last_full_calib_ts) >= full_calib_interval_ms:
-            result = calibrate_global_essvi(snap, model, bid_col="bid_iv", ask_col="ask_iv", verbose=False)
+            # speed_mode="fast" (L-BFGS-B) instead of "auto" (picks "thorough"
+            # NM+NM for n<=25 slices, which this data has): ~3.75x faster per
+            # call on real data (3.69s vs 13.86s), confirmed the dominant cost
+            # in a full-day profile (69 full recalibrations ~= 11 of 35 min).
+            # A prior session found "fast" ~96% equivalent to "thorough" with
+            # one documented rare failure on a specific snapshot — acceptable
+            # here (backtest signal noise on a rare snapshot, not live risk).
+            result = calibrate_global_essvi(snap, model, bid_col="bid_iv", ask_col="ask_iv",
+                                             speed_mode="fast", verbose=False)
             last_full_calib_ts = ts_ms
         else:
             result = calibrate_global_essvi_update(snap, last_calib_result, mode="theta_only",
@@ -277,7 +326,10 @@ def run_backtest(chunk_dir: str, perp_path: str,
             last_hedge_F = F_perp
             last_hedge_hour = hour
 
-        if verbose and n_snapshots % 500 == 0:
+        if plotter is not None:
+            status = f"[{n_snapshots} snapshots] {len(positions)} open positions, {len(events)} events so far"
+            plotter.maybe_render(events, status=status)
+        elif verbose and n_snapshots % 500 == 0:
             label = snap["file_timestamp"].iloc[0] if "file_timestamp" in snap.columns else ts
             print(f"[{n_snapshots}] {label} — {len(positions)} open positions, {len(events)} events so far")
 
@@ -286,6 +338,9 @@ def run_backtest(chunk_dir: str, perp_path: str,
         events.append({"instrument_id": inst_id, "action": "exit", "reason": "end_of_data",
                         "timestamp": ts_ms, "side": pos["side"], "price": None,
                         "contracts": pos["contracts"], "option_cost": 0.0, "option_pnl": None})
+
+    if plotter is not None:
+        plotter.maybe_render(events, status=f"Done — {len(events)} events total.", force=True)
 
     return events
 

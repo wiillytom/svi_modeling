@@ -132,6 +132,7 @@ def run_backtest(chunk_dir: str, perp_path: str,
                   max_chunks: int | None = None,
                   verbose: bool = True,
                   invert_signal: bool = False,
+                  min_edge_multiple: float = 2.0,
                   live_plot_pnl: bool = False,
                   live_plot_interval_secs: float = 3.0) -> list[dict]:
     """Run the backtest over every snapshot in `chunk_dir`'s cleaned chunk
@@ -148,6 +149,17 @@ def run_backtest(chunk_dir: str, perp_path: str,
     what's driving P&L. Does NOT flip transaction costs (spread-crossing and
     fees are paid regardless of side) or the delta hedge (still hedges
     whatever position is actually held), only the entry/exit direction.
+
+    `min_edge_multiple`: only enter (or rotate into) a red cell whose
+    mispricing exceeds this multiple of its own half-spread. Default 2.0 =
+    require the edge to clear the round-trip cost of crossing the spread
+    twice (once to enter, once to exit) — a real snapshot check found most
+    raw red cells (any crossing at 4dp, no minimum size, matching the live
+    screen's definition) don't clear even this bar, meaning they lose money
+    by construction before the explicit transaction cost is even applied.
+    Set to 0 to disable filtering and trade every red cell (the original
+    behaviour, matching the live screen exactly). Does not affect null-out
+    exits, which still use the unfiltered red-cell flag.
 
     `live_plot_pnl`: redraw a cumulative-P&L chart in the notebook cell every
     `live_plot_interval_secs` (see `live_plot.LivePnLPlot`) — a static
@@ -220,14 +232,33 @@ def run_backtest(chunk_dir: str, perp_path: str,
         # the dominant cost of a 21-minutes-for-one-day run. This also
         # unifies what used to be two slightly different edge formulas (one
         # in the exits pass, one in entries) into one.
+        #
+        # `slot_best` is computed from `tradeable`, NOT the raw `red` table:
+        # a real snapshot check found the majority of raw red cells have a
+        # mispricing SMALLER than the round-trip cost of crossing the spread
+        # twice (once to enter, once to exit) — trading those loses money by
+        # construction even with a perfect, instantly-converging signal,
+        # before the explicit transaction cost is even applied. `min_edge_multiple`
+        # filters those out of consideration for BOTH fresh entries and
+        # rotation, so we never rotate out of a held position for an
+        # "improvement" that isn't itself worth entering (which would leave
+        # the slot empty — strictly worse than holding the original).
+        # Null-out exits are unaffected — those still use the unfiltered
+        # `flagged`/`red_cell` below, matching the live screen's definition
+        # exactly (has the mispricing that justified this trade disappeared,
+        # not "is what's left still big enough to newly enter").
         slot_best: dict[tuple, pd.Series] = {}
         if not red.empty:
             red = red.copy()
             red["_slot"] = list(zip(red["strike"].astype(float), red["expiration_timestamp_ms"].astype(float)))
             touch = np.where(red["signal_side"] == "buy", red["ask_price"], red["bid_price"])
-            red["_edge"] = (red["theo_price"] - touch).abs() * red["vega"]
-            best_idx = red.groupby("_slot")["_edge"].idxmax()
-            slot_best = {slot: red.loc[idx] for slot, idx in best_idx.items()}
+            red["_raw_edge"] = (red["theo_price"] - touch).abs()
+            red["_half_spread"] = (red["ask_price"] - red["bid_price"]) / 2.0
+            red["_edge"] = red["_raw_edge"] * red["vega"]
+            tradeable = red[red["_raw_edge"] > min_edge_multiple * red["_half_spread"]]
+            if not tradeable.empty:
+                best_idx = tradeable.groupby("_slot")["_edge"].idxmax()
+                slot_best = {slot: tradeable.loc[idx] for slot, idx in best_idx.items()}
 
         F_perp = _perp_price_at(perp_ts, perp_close, ts_ms)
 

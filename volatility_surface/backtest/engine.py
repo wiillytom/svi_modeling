@@ -50,13 +50,18 @@ def _perp_price_at(perp_ts: np.ndarray, perp_close: np.ndarray, ts_ms: int) -> f
     return float(perp_close[idx])
 
 
-def _iter_snapshots(chunk_dir: str):
+def _iter_snapshots(chunk_dir: str, max_chunks: int | None = None):
     """Yield (file_timestamp, snapshot_df) across every chunk parquet in
     `chunk_dir`, in chronological order. Chunk files are named
     chunk_00000.parquet, chunk_00001.parquet, ... in day order
     (`clean_bulk_parquet_chunked`), so sorting filenames preserves global
-    chronology; within a chunk, groupby+sort_values orders snapshots too."""
+    chronology; within a chunk, groupby+sort_values orders snapshots too.
+
+    `max_chunks` limits how many chunk FILES (not snapshots) are read — pass
+    1 to try the engine on a single day before committing to a full run."""
     paths = sorted(glob.glob(os.path.join(chunk_dir, "chunk_*.parquet")))
+    if max_chunks is not None:
+        paths = paths[:max_chunks]
     for path in paths:
         day_df = pl.read_parquet(path).to_pandas()
         if day_df.empty:
@@ -86,10 +91,15 @@ def _option_notional_cost(mid_price: float, contracts: float) -> float:
 def run_backtest(chunk_dir: str, perp_path: str,
                   target_vega_dollars: float = TARGET_VEGA_DOLLARS,
                   full_calib_interval_ms: int = FULL_CALIB_INTERVAL_MS,
+                  max_chunks: int | None = None,
                   verbose: bool = True) -> list[dict]:
     """Run the backtest over every snapshot in `chunk_dir`'s cleaned chunk
     parquets (must have been produced with `otm_only=False` — the strategy
     needs the full ITM+OTM universe, not just the calibration-ready OTM one).
+
+    `max_chunks`: limit to the first N chunk files (= N days, one chunk per
+    day from `clean_bulk_parquet_chunked`) instead of the whole directory —
+    pass 1 to time a single day before committing to the full range.
 
     Returns a list of event dicts (one per entry/exit) — hand this to
     `results.py` for aggregation. Each event has: instrument_id, strike,
@@ -115,7 +125,7 @@ def run_backtest(chunk_dir: str, perp_path: str,
     events: list[dict] = []
     n_snapshots = 0
 
-    for ts, snap in _iter_snapshots(chunk_dir):
+    for ts, snap in _iter_snapshots(chunk_dir, max_chunks=max_chunks):
         n_snapshots += 1
         ts_ms = int(snap["creation_timestamp_x"].iloc[0])
 

@@ -27,9 +27,10 @@ import polars as pl
 
 from volatility_surface.core.calibration.calibrator import (
     calibrate_global_essvi, calibrate_global_essvi_update,
+    calibrate_snapshot, calibrate_snapshot_sabr_update,
 )
-from volatility_surface.models.vol_models import eSSVI
-from volatility_surface.backtest.signal import detect_red_cells, implied_carry_rate
+from volatility_surface.models.vol_models import eSSVI, RawSVI
+from volatility_surface.backtest.signal import detect_red_cells, implied_carry_rate, detect_calendar_arb
 from volatility_surface.backtest import live_plot
 
 
@@ -38,6 +39,42 @@ OPTION_COST_BPS = 50.0                     # Lucic & Sepp Assumption 5.1
 PERP_COST_BPS = 5.0                        # Lucic & Sepp Assumption 5.1
 TARGET_VEGA_DOLLARS = 1000.0
 HOURS_PER_YEAR = 365.0 * 24.0
+
+
+def _make_calibrator(model_name: str):
+    """Returns (model_instance, full_fn, update_fn) with a uniform call
+    signature: full_fn(snap, bid_col=, ask_col=, verbose=) -> result dict;
+    update_fn(snap, prev_result, bid_col=, ask_col=, verbose=) -> result dict.
+    Lets `run_backtest` swap models without the main loop caring which one —
+    e.g. to check whether eSSVI's structural fitting limitation (documented
+    elsewhere in this project: ~18-28% "red cell" floor purely from its
+    3-params/slice functional form, independent of real mispricing) is
+    inflating how many red cells looked tradeable, by comparing against
+    RawSVI's richer 5-params/slice per-expiry fit.
+    """
+    if model_name == "essvi":
+        model = eSSVI()
+
+        def full_fn(snap, **kw):
+            return calibrate_global_essvi(snap, model, speed_mode="fast", **kw)
+
+        def update_fn(snap, prev_result, **kw):
+            return calibrate_global_essvi_update(snap, prev_result, mode="theta_only", **kw)
+
+        return model, full_fn, update_fn
+
+    if model_name in ("svi", "rawsvi"):
+        model = RawSVI()
+
+        def full_fn(snap, **kw):
+            return calibrate_snapshot(snap, model, **kw)
+
+        def update_fn(snap, prev_result, **kw):
+            return calibrate_snapshot_sabr_update(snap, prev_result, model=model, **kw)
+
+        return model, full_fn, update_fn
+
+    raise ValueError(f"unknown model_name {model_name!r} — use 'essvi' or 'svi'")
 
 
 def _load_perp_series(perp_path: str) -> pd.DataFrame:
@@ -126,18 +163,48 @@ def _option_notional_cost(mid_price: float, contracts: float) -> float:
     return OPTION_COST_BPS / 10_000.0 * mid_price * contracts
 
 
+def _nearest_leg(snap: pd.DataFrame, t_target: float, k_target: float) -> pd.Series | None:
+    """Nearest listed instrument to (t_target, k_target) for a calendar-spread
+    leg. Matches this project's OTM convention (call for k>=0, put for k<=0)
+    since forwards differ across expiries — the same k_target maps to a
+    different strike at each expiry (K = F * exp(k)), so this can't just look
+    up a strike directly, it has to search each expiry's own listed strikes
+    by k. Returns None if that expiry has no quotes in this snapshot."""
+    sub = snap[np.isclose(snap["t"], t_target)]
+    if sub.empty:
+        return None
+    option_type = "C" if k_target >= 0 else "P"
+    sub = sub[sub["option_type"] == option_type]
+    if sub.empty:
+        return None
+    idx = (sub["k"] - k_target).abs().idxmin()
+    return sub.loc[idx]
+
+
 def run_backtest(chunk_dir: str, perp_path: str,
+                  model_name: str = "essvi",
                   target_vega_dollars: float = TARGET_VEGA_DOLLARS,
                   full_calib_interval_ms: int = FULL_CALIB_INTERVAL_MS,
                   max_chunks: int | None = None,
                   verbose: bool = True,
                   invert_signal: bool = False,
                   min_edge_multiple: float = 2.0,
+                  enable_calendar_arb: bool = False,
+                  calendar_arb_tol: float = 1e-6,
                   live_plot_pnl: bool = False,
                   live_plot_interval_secs: float = 3.0) -> list[dict]:
     """Run the backtest over every snapshot in `chunk_dir`'s cleaned chunk
     parquets (must have been produced with `otm_only=False` — the strategy
     needs the full ITM+OTM universe, not just the calibration-ready OTM one).
+
+    `model_name`: "essvi" (global eSSVI, `calibrate_global_essvi[_update]`) or
+    "svi" (per-slice RawSVI, `calibrate_snapshot`/`calibrate_snapshot_sabr_update`
+    for the warm-started path). RawSVI fits each expiry independently with 5
+    parameters instead of eSSVI's global 2-parameter power-law curvature —
+    tighter per-slice fit, no arb-free guarantee across slices. Useful to
+    check whether eSSVI's documented structural fitting limitation is
+    inflating the red-cell count with model-form artifacts rather than real
+    mispricing.
 
     `max_chunks`: limit to the first N chunk files (= N days, one chunk per
     day from `clean_bulk_parquet_chunked`) instead of the whole directory —
@@ -160,6 +227,26 @@ def run_backtest(chunk_dir: str, perp_path: str,
     Set to 0 to disable filtering and trade every red cell (the original
     behaviour, matching the live screen exactly). Does not affect null-out
     exits, which still use the unfiltered red-cell flag.
+
+    `enable_calendar_arb`: also trade calendar-spread arbitrage between
+    adjacent expiry slices (`signal.detect_calendar_arb`) — a genuinely
+    different, model-INTERNAL signal from the red cells (which compare the
+    model to the market's own quotes): this checks whether the calibrated
+    surface is even theoretically arbitrage-free across time, independent of
+    any bid/ask. Only meaningful for `model_name="svi"` (RawSVI has no
+    cross-slice constraint so it CAN violate this; eSSVI/SSVI/SABR enforce it
+    by construction and will essentially never trigger it). On real data
+    checked this session (30 snapshots, 300 adjacent pairs), this fired
+    exactly 0 times — RawSVI's global-init-assisted per-slice fits stayed
+    correctly ordered throughout, so don't expect much action from this on
+    similar data; it's here in case your full multi-month range behaves
+    differently (e.g. during sharp moves). When triggered: sells the
+    near-expiry leg, buys the far-expiry leg, both at the strike nearest the
+    violation's log-moneyness (`k_star`, converted via each expiry's own
+    forward — they differ across expiries) — a static, model-free arbitrage
+    if the violation is real, not a view on realized vol. Exits both legs
+    together when the violation resolves (recomputed each snapshot) or the
+    near leg's own time-to-expiry decays to zero.
 
     `live_plot_pnl`: redraw a cumulative-P&L chart in the notebook cell every
     `live_plot_interval_secs` (see `live_plot.LivePnLPlot`) — a static
@@ -184,12 +271,13 @@ def run_backtest(chunk_dir: str, perp_path: str,
     perp_ts = perp_df["timestamp_ms"].to_numpy()
     perp_close = perp_df["close"].to_numpy()
 
-    model = eSSVI()
+    model, calibrate_full, calibrate_update = _make_calibrator(model_name)
     last_calib_result = None
     last_full_calib_ts = None
 
     positions: dict[str, dict] = {}       # instrument_id -> position dict
     slot_owner: dict[tuple, str] = {}     # slot_key -> instrument_id currently holding it
+    calendar_positions: dict[tuple, dict] = {}  # (t_near, t_far) -> {"near": pos, "far": pos}
 
     hedge_notional = 0.0                  # coin-denominated aggregate hedge (perp units), signed
     last_hedge_F = None
@@ -202,21 +290,20 @@ def run_backtest(chunk_dir: str, perp_path: str,
         n_snapshots += 1
         ts_ms = int(snap["creation_timestamp_x"].iloc[0])
 
-        # ---- 1. calibration (full every full_calib_interval_ms, theta_only warm-start otherwise) ----
+        # ---- 1. calibration (full every full_calib_interval_ms, warm-start otherwise) ----
+        # For eSSVI, speed_mode="fast" (L-BFGS-B) instead of "auto" (picks
+        # "thorough" NM+NM for n<=25 slices, which this data has): ~3.75x
+        # faster per call on real data (3.69s vs 13.86s), confirmed the
+        # dominant cost in a full-day profile (69 full recalibrations ~= 11
+        # of 35 min). A prior session found "fast" ~96% equivalent to
+        # "thorough" with one documented rare failure on a specific snapshot
+        # — acceptable here (backtest signal noise on a rare snapshot, not
+        # live risk). RawSVI's calibrate_snapshot has no such knob.
         if last_calib_result is None or (ts_ms - last_full_calib_ts) >= full_calib_interval_ms:
-            # speed_mode="fast" (L-BFGS-B) instead of "auto" (picks "thorough"
-            # NM+NM for n<=25 slices, which this data has): ~3.75x faster per
-            # call on real data (3.69s vs 13.86s), confirmed the dominant cost
-            # in a full-day profile (69 full recalibrations ~= 11 of 35 min).
-            # A prior session found "fast" ~96% equivalent to "thorough" with
-            # one documented rare failure on a specific snapshot — acceptable
-            # here (backtest signal noise on a rare snapshot, not live risk).
-            result = calibrate_global_essvi(snap, model, bid_col="bid_iv", ask_col="ask_iv",
-                                             speed_mode="fast", verbose=False)
+            result = calibrate_full(snap, bid_col="bid_iv", ask_col="ask_iv", verbose=False)
             last_full_calib_ts = ts_ms
         else:
-            result = calibrate_global_essvi_update(snap, last_calib_result, mode="theta_only",
-                                                     bid_col="bid_iv", ask_col="ask_iv", verbose=False)
+            result = calibrate_update(snap, last_calib_result, bid_col="bid_iv", ask_col="ask_iv", verbose=False)
         last_calib_result = result
 
         # ---- 2. signal ----
@@ -330,6 +417,77 @@ def run_backtest(chunk_dir: str, perp_path: str,
                 "contracts": contracts, "option_cost": cost, "option_pnl": None,
             })
 
+        # ---- 4.5 calendar-spread arbitrage (only fires in practice for
+        # model_name="svi" — eSSVI/SSVI/SABR enforce this by construction) ----
+        if enable_calendar_arb:
+            violations = detect_calendar_arb(result, tol=calendar_arb_tol)
+            still_valid_keys = set()
+            for v in violations:
+                near_row = _nearest_leg(snap, v["t_near"], v["k_star"])
+                far_row = _nearest_leg(snap, v["t_far"], v["k_star"])
+                if near_row is None or far_row is None:
+                    continue
+                key = (float(near_row["expiration_timestamp_ms"]), float(far_row["expiration_timestamp_ms"]))
+                still_valid_keys.add(key)
+                if key in calendar_positions:
+                    continue  # already open, leave it running
+
+                # Sell near (calendar-arb says it shows MORE total variance
+                # than the far leg, which is backwards), buy far (cheap in
+                # variance terms) — validate both legs BEFORE opening either,
+                # so a bad price/vega on one side never leaves an orphaned,
+                # unpaired entry event for the other.
+                leg_specs = []
+                ok = True
+                for row2, side in [(near_row, "sell"), (far_row, "buy")]:
+                    vega = float(row2["vega"])
+                    entry_price = row2["ask_price"] if side == "buy" else row2["bid_price"]
+                    if not (np.isfinite(vega) and vega > 0 and np.isfinite(entry_price) and entry_price > 0):
+                        ok = False
+                        break
+                    vega_usd = vega * float(row2["underlying_price"])
+                    contracts = target_vega_dollars / vega_usd
+                    mid_price = float((row2["bid_price"] + row2["ask_price"]) / 2.0)
+                    leg_specs.append({
+                        "instrument_id": row2["instrument_id"], "side": side,
+                        "entry_time": ts_ms, "entry_price": float(entry_price), "contracts": contracts,
+                        "inverse_delta_at_entry": float(row2["inverse_delta"]),
+                        "cost": _option_notional_cost(mid_price, contracts),
+                    })
+                if not ok:
+                    continue
+                legs = {"near": leg_specs[0], "far": leg_specs[1]}
+                calendar_positions[key] = legs
+                for leg in legs.values():
+                    events.append({
+                        "instrument_id": leg["instrument_id"], "action": "entry", "reason": "calendar_arb",
+                        "timestamp": ts_ms, "side": leg["side"], "price": leg["entry_price"],
+                        "contracts": leg["contracts"], "option_cost": leg["cost"], "option_pnl": None,
+                    })
+
+            # close any open calendar spread whose violation has resolved
+            for key in list(calendar_positions.keys()):
+                if key in still_valid_keys:
+                    continue
+                legs = calendar_positions.pop(key)
+                for leg in legs.values():
+                    inst_id = leg["instrument_id"]
+                    if inst_id in flagged.index:
+                        row2 = flagged.loc[inst_id]
+                        exit_price = float(row2["bid_price"] if leg["side"] == "buy" else row2["ask_price"])
+                        mid_price = float((row2["bid_price"] + row2["ask_price"]) / 2.0)
+                    else:
+                        exit_price = leg["entry_price"]  # not quoted this snapshot — stale fallback
+                        mid_price = leg["entry_price"]
+                    sign = 1.0 if leg["side"] == "buy" else -1.0
+                    pnl = sign * (exit_price - leg["entry_price"]) * leg["contracts"]
+                    cost = _option_notional_cost(mid_price, leg["contracts"])
+                    events.append({
+                        "instrument_id": inst_id, "action": "exit", "reason": "calendar_resolved",
+                        "timestamp": ts_ms, "side": leg["side"], "price": exit_price,
+                        "contracts": leg["contracts"], "option_cost": cost, "option_pnl": pnl,
+                    })
+
         # ---- 5. hourly delta-hedge rebalance + funding ----
         hour = ts_ms // 3_600_000
         if last_hedge_hour is None or hour != last_hedge_hour:
@@ -339,9 +497,10 @@ def run_backtest(chunk_dir: str, perp_path: str,
                                 "timestamp": ts_ms, "side": None, "price": F_perp,
                                 "contracts": hedge_notional, "option_cost": 0.0, "option_pnl": hedge_pnl})
 
+            calendar_legs = [leg for legs in calendar_positions.values() for leg in legs.values()]
             target_notional = -sum(
                 p["inverse_delta_at_entry"] * p["contracts"] * (1.0 if p["side"] == "buy" else -1.0)
-                for p in positions.values()
+                for p in list(positions.values()) + calendar_legs
             )
             rebalance_cost = PERP_COST_BPS / 10_000.0 * abs(target_notional - hedge_notional)
 
@@ -377,6 +536,11 @@ def run_backtest(chunk_dir: str, perp_path: str,
         events.append({"instrument_id": inst_id, "action": "exit", "reason": "end_of_data",
                         "timestamp": ts_ms, "side": pos["side"], "price": None,
                         "contracts": pos["contracts"], "option_cost": 0.0, "option_pnl": None})
+    for legs in calendar_positions.values():
+        for leg in legs.values():
+            events.append({"instrument_id": leg["instrument_id"], "action": "exit", "reason": "end_of_data",
+                            "timestamp": ts_ms, "side": leg["side"], "price": None,
+                            "contracts": leg["contracts"], "option_cost": 0.0, "option_pnl": None})
 
     if plotter is not None:
         plotter.maybe_render(events, status=f"Done — {len(events)} events total.", force=True)

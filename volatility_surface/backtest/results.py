@@ -97,3 +97,24 @@ def print_summary(summary: dict) -> None:
     print()
     print("P&L by exit reason:")
     print(summary["pnl_by_exit_reason"])
+
+
+def running_pnl_series(events: list[dict]) -> pd.DataFrame:
+    """Cumulative net P&L over time, built directly from the event stream —
+    one-shot / post-hoc version (recomputes from scratch each call). For a
+    live-updating chart DURING a run, use `live_plot.LivePnLPlot` instead,
+    which updates incrementally rather than reprocessing every event each
+    time it's called.
+
+    Same P&L components `summarize()` totals, just accumulated in event
+    order instead of summed at the end: option P&L net of transaction cost on
+    entries and exits, plus hedge P&L, plus implied funding cost net of
+    rebalance cost.
+    """
+    df = pd.DataFrame(events)
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp", "cum_pnl"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    pnl_delta = df["option_pnl"].fillna(0.0) - df["option_cost"].fillna(0.0)
+    df = df.assign(cum_pnl=pnl_delta.cumsum())
+    return df[["timestamp", "cum_pnl"]]

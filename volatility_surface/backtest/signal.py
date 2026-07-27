@@ -123,3 +123,50 @@ def implied_carry_rate(underlying_price: float, estimated_delivery_price: float,
     if estimated_delivery_price is None or estimated_delivery_price <= 0 or t <= 0:
         return 0.0
     return float(np.log(underlying_price / estimated_delivery_price) / t)
+
+
+def detect_calendar_arb(calib_result: dict, k_range: tuple = (-3.0, 3.0), n: int = 200,
+                         tol: float = 1e-6) -> list[dict]:
+    """Calendar-spread arbitrage between ADJACENT expiry slices of a
+    calibration result: for a fixed k, total variance w(k,T) must be
+    non-decreasing in T. Violations are checked pairwise-adjacent, matching
+    `enforce_calendar_arbfree`'s convention in calibrator.py.
+
+    This is a genuinely different signal from `detect_red_cells`: that one
+    compares the model to the MARKET's own bid/ask (is the smile internally
+    consistent with what's quoted); this one is a pure MODEL-INTERNAL
+    consistency check across time (is the calibrated surface even
+    theoretically arbitrage-free), independent of any market quote. Models
+    that enforce this by construction (eSSVI, SSVI, SABR — all use a
+    calendar penalty or global-theta monotonicity) will essentially never
+    trigger it; RawSVI, fit independently per slice with no cross-slice
+    constraint, can (verified 0/300 on a real sample, but that's not a
+    guarantee — see `crossedness` in calibrator.py, the same primitive this
+    wraps).
+
+    Returns one dict per violating adjacent pair (usually empty):
+        {t_near, t_far, k_star, crossedness, params_near, params_far}
+    `k_star` is the log-moneyness where the violation is largest — trade
+    idea: at k_star, the near slice shows MORE total variance than the far
+    slice, which is backwards (a genuine, static/model-free arbitrage, not a
+    view on realized vol) — sell the near-expiry option and buy the
+    far-expiry option, both at the strike nearest `k_star` (converted via
+    each expiry's own forward, since forwards differ across expiries), same
+    call/put type.
+    """
+    model = calib_result["_model"]
+    expiries = calib_result["expiries"]
+    params = calib_result["params"]
+    k_grid = np.linspace(k_range[0], k_range[1], n)
+
+    violations = []
+    for i in range(len(expiries) - 1):
+        diff = model.w(k_grid, params[i]) - model.w(k_grid, params[i + 1])
+        j = int(np.argmax(diff))
+        if diff[j] > tol:
+            violations.append({
+                "t_near": expiries[i], "t_far": expiries[i + 1],
+                "k_star": float(k_grid[j]), "crossedness": float(diff[j]),
+                "params_near": params[i], "params_far": params[i + 1],
+            })
+    return violations

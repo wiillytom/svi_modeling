@@ -32,9 +32,20 @@ Accounting: Coin-based (§5.1.2, Eqs 39-44) — Deribit-native, the measure the
 paper's headline figures use. USD accounting (Eqs 46-52) is a thin wrapper for
 a later phase.
 
-Funding (Eq 29): the perp series is OHLCV close only (no funding column), so
-`funding_annual_rate` defaults to 0.0 and is reported as its own P&L line. Pass
-a constant to approximate it (short-ATM funding ran ~-8%/yr in the paper).
+Execution & marking (more realistic than the paper's Assumption 5.1): each leg
+is TRADED across the real spread — a long leg buys at the ask, a short leg sells
+at the bid — and the open book is MARKED at mid every hedge hour. The half-spread
+cost therefore surfaces automatically in the NAV path the instant a position is
+opened (bought at ask, immediately worth mid), and the hourly mid mark makes the
+NAV continuous so daily vol/Sharpe/MaxDD are meaningful. This replaces the flat
+50bp-on-mid of Assumption 5.1; `option_fee_bps` (default 0) adds any explicit
+exchange fee ON TOP of the spread. Settlement is the intrinsic coin payoff
+(cash-settled, no spread).
+
+Funding (Eq 29): pass `funding_series` = a Deribit funding parquet (from
+`utils.deribit_funding.fetch_funding`) for the realised hourly rate charged on
+the perp position held each hour (correct Deribit sign: a long perp pays when
+the rate is positive). `funding_annual_rate` is a constant fallback; 0 = omit.
 """
 
 from __future__ import annotations
@@ -263,10 +274,21 @@ def _select_structure(snap: pd.DataFrame, target_expiry_ms: float, legs_spec: li
         mid, iv = _mid_price(row), _mid_iv(row)
         if not (np.isfinite(mid) and mid > 0 and np.isfinite(iv) and iv > 0):
             return None
+        # Cross the spread on the actual trade: a long leg (qty>0) BUYS at the
+        # ask, a short leg (qty<0) SELLS at the bid. Fall back to mid only if
+        # that side of the book is missing. The half-spread cost then surfaces
+        # automatically once the position is marked at mid (see `_do_hedge`).
+        bid = float(row.get("bid_price", np.nan))
+        ask = float(row.get("ask_price", np.nan))
+        if qty > 0:
+            entry_exec = ask if (np.isfinite(ask) and ask > 0) else mid
+        else:
+            entry_exec = bid if (np.isfinite(bid) and bid > 0) else mid
         legs.append({"instrument_id": row["instrument_id"], "strike": float(row["strike"]),
                      "option_type": otype, "qty": float(qty),
                      "expiration_timestamp_ms": float(chosen),
-                     "entry_mid": float(mid), "entry_iv": float(iv), "F_expiry": F})
+                     "entry_mid": float(mid), "entry_exec": float(entry_exec),
+                     "entry_iv": float(iv), "F_expiry": F})
     return legs
 
 
@@ -307,7 +329,7 @@ def _settle(state: dict, S_T: float, ts_ms: int, initial_coin: float) -> None:
     opt = 0.0
     for leg in state["open_legs"]:
         payoff = _coin_payoff(leg["option_type"], leg["strike"], S_T)
-        opt += leg["contracts"] * (payoff - leg["entry_mid"])
+        opt += leg["contracts"] * (payoff - leg["entry_exec"])
     state["cum_pnl"] += opt
     state["events"].append({"action": "settle", "timestamp": ts_ms, "option_pnl": opt,
                             "option_cost": 0.0, "hedge_pnl": 0.0, "funding": 0.0, "rebalance_cost": 0.0})
@@ -321,7 +343,9 @@ def _open(state: dict, legs: list[dict], ts_ms: int, cfg) -> None:
     cost = 0.0
     for leg in legs:
         leg["contracts"] = leg["qty"] * N
-        cost += cfg.opt_cost_frac * abs(leg["contracts"]) * leg["entry_mid"]
+        # Explicit fee ON TOP of the spread (which is already paid via entry@bid/ask
+        # marked at mid). Defaults to 0 — set option_fee_bps to add exchange fees.
+        cost += cfg.opt_fee_frac * abs(leg["contracts"]) * leg["entry_mid"]
     state["cum_pnl"] -= cost
     state["open_legs"] = legs
     state["events"].append({"action": "open", "timestamp": ts_ms, "option_pnl": 0.0,
@@ -350,15 +374,17 @@ def _do_rolls(state: dict, snap: pd.DataFrame, ts_ms: int,
 
 
 def _do_hedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, F_perp: float, cfg) -> None:
+    prev_notional = state["hedge_notional"]  # perp position held over the past hour
     hedge_pnl = 0.0
-    if state["last_hedge_F"] is not None and state["hedge_notional"] != 0.0:
-        hedge_pnl = (F_perp - state["last_hedge_F"]) / F_perp * state["hedge_notional"]  # Eq 26
+    if state["last_hedge_F"] is not None and prev_notional != 0.0:
+        hedge_pnl = (F_perp - state["last_hedge_F"]) / F_perp * prev_notional  # Eq 26
         state["cum_pnl"] += hedge_pnl
 
     target = 0.0
+    unrealized = 0.0  # mark-to-market of the open option book (Coin), at MID
     if state["open_legs"] is not None:
         for leg in state["open_legs"]:
-            iv, F_exp, T = leg["entry_iv"], leg["F_expiry"], None
+            iv, F_exp, T, mark = leg["entry_iv"], leg["F_expiry"], None, None
             if leg["instrument_id"] in snap_idx.index:
                 r = snap_idx.loc[leg["instrument_id"]]
                 if isinstance(r, pd.DataFrame):
@@ -367,14 +393,29 @@ def _do_hedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, F_perp: float, cf
                 if np.isfinite(m):
                     iv = m
                 F_exp, T = float(r["underlying_price"]), float(r["t"])
+                mp = _mid_price(r)
+                if np.isfinite(mp) and mp > 0:
+                    mark = mp
             if T is None:  # instrument not quoted this snapshot: decay T off expiry
                 T = max((leg["expiration_timestamp_ms"] - ts_ms) / (MS_PER_DAY * 365.0), 1e-6)
+            if mark is None:  # no live mid: model-mark at current fwd/vol
+                px_usd = bs_pricing(F_exp, leg["strike"], T, iv, leg["option_type"] == "C")[0]
+                mark = float(px_usd) / F_exp
             target += -(leg["contracts"] * _leg_net_delta(leg["strike"], leg["option_type"], F_exp, iv, T))
+            unrealized += leg["contracts"] * (mark - leg["entry_exec"])
 
-    rebalance = cfg.perp_cost_frac * abs(target - state["hedge_notional"])
+    rebalance = cfg.perp_cost_frac * abs(target - prev_notional)
+    # DeltaFunding (Eq 29): accrued on the position HELD over the past hour.
+    # A funding_fn returns Deribit's per-hour funding fraction (interest_1h)
+    # applied directly; a constant funding_rate is annualised and de-annualised.
+    # Sign convention (Deribit, paper Eqs 29-30): a long perp position pays
+    # funding when the rate is positive -> negative P&L.
     funding = 0.0
-    if cfg.funding_rate and target != 0.0:
-        funding = -(cfg.funding_rate / HOURS_PER_YEAR) * target
+    if prev_notional != 0.0:
+        if cfg.funding_fn is not None:
+            funding = -cfg.funding_fn(ts_ms) * prev_notional
+        elif cfg.funding_rate:
+            funding = -(cfg.funding_rate / HOURS_PER_YEAR) * prev_notional
     state["cum_pnl"] += funding - rebalance
     if hedge_pnl or rebalance or funding:
         state["events"].append({"action": "hedge", "timestamp": ts_ms, "option_pnl": 0.0,
@@ -382,8 +423,13 @@ def _do_hedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, F_perp: float, cf
                                 "rebalance_cost": rebalance})
     state["hedge_notional"] = target
     state["last_hedge_F"] = F_perp
-    state["nav_rows"].append({"timestamp": ts_ms, "coin_nav": cfg.initial_coin + state["cum_pnl"],
-                              "cum_pnl": state["cum_pnl"], "coin_px": F_perp})
+    # NAV = starting coin + realised P&L + unrealised mark of the open book, so
+    # the path is continuous hour-to-hour (the option no longer only "appears"
+    # at settlement) — this is what makes daily vol/Sharpe/MaxDD meaningful.
+    state["nav_rows"].append({"timestamp": ts_ms,
+                              "coin_nav": cfg.initial_coin + state["cum_pnl"] + unrealized,
+                              "cum_pnl": state["cum_pnl"], "unrealized": unrealized,
+                              "coin_px": F_perp})
 
 
 def _finalize(state: dict, cfg) -> dict:
@@ -392,27 +438,46 @@ def _finalize(state: dict, cfg) -> dict:
             "params": {"structure": state["name"], "frequency": state["frequency"],
                        "initial_coin": cfg.initial_coin, "size_multiple": cfg.size_multiple,
                        "funding_annual_rate": cfg.funding_rate,
-                       "option_cost_bps": OPTION_COST_BPS, "perp_cost_bps": PERP_COST_BPS}}
+                       "option_fee_bps": cfg.opt_fee_frac * 10_000.0,
+                       "perp_cost_bps": PERP_COST_BPS, "execution": "bid/ask entry, mid MTM"}}
 
 
 # --------------------------------------------------------------------------- #
 # Runners
 # --------------------------------------------------------------------------- #
+def _resolve_funding(funding_series):
+    """funding_series may be a parquet path (str) of Deribit funding history, a
+    callable ts_ms -> interest_1h, or None. Returns a callable or None."""
+    if funding_series is None:
+        return None
+    if callable(funding_series):
+        return funding_series
+    from volatility_surface.utils.deribit_funding import load_funding_lookup
+    return load_funding_lookup(funding_series)
+
+
 def run_all_strategies(option_path: str, perp_path: str,
                        catalog: dict[str, list[tuple]] | None = None,
                        frequencies: tuple[str, ...] = ("weekly",),
                        initial_coin: float = 1.0, size_multiple: float = 1.0,
-                       funding_annual_rate: float = 0.0,
+                       funding_annual_rate: float = 0.0, funding_series=None,
+                       option_fee_bps: float = 0.0,
                        max_snaps: int | None = None, verbose: bool = True) -> dict[str, dict]:
     """Backtest an entire catalog x frequencies in ONE pass over the option
     data. Returns {strategy_name: result_dict}; hand the whole dict to
     `roll_results.results_table` for the paper-style table. When more than one
-    frequency is requested, each name is suffixed " [freq]"."""
+    frequency is requested, each name is suffixed " [freq]".
+
+    Funding (Eq 29): pass `funding_series` = path to a Deribit funding parquet
+    (see `utils.deribit_funding.fetch_funding`) for realised hourly funding — the
+    faithful term. `funding_annual_rate` is a constant fallback used only when
+    `funding_series` is None."""
     catalog = catalog or build_catalog()
     cfg = types.SimpleNamespace(initial_coin=initial_coin, size_multiple=size_multiple,
-                                opt_cost_frac=OPTION_COST_BPS / 10_000.0,
+                                opt_fee_frac=option_fee_bps / 10_000.0,
                                 perp_cost_frac=PERP_COST_BPS / 10_000.0,
-                                funding_rate=funding_annual_rate)
+                                funding_rate=funding_annual_rate,
+                                funding_fn=_resolve_funding(funding_series))
 
     perp_ts, perp_close = _perp_series(perp_path)
     first_ts = next(_iter_snapshots(option_path, max_snaps=1))[0]
@@ -452,7 +517,8 @@ def run_all_strategies(option_path: str, perp_path: str,
 def run_roll_backtest(option_path: str, perp_path: str,
                       structure: str = "Short Straddle", frequency: str = "weekly",
                       initial_coin: float = 1.0, size_multiple: float = 1.0,
-                      funding_annual_rate: float = 0.0,
+                      funding_annual_rate: float = 0.0, funding_series=None,
+                      option_fee_bps: float = 0.0,
                       max_snaps: int | None = None, verbose: bool = True) -> dict:
     """Single-strategy wrapper on `run_all_strategies`. `structure` is a catalog
     name ("Short Straddle", "Long 25D Strangle", ...) or an old lowercase alias
@@ -464,5 +530,6 @@ def run_roll_backtest(option_path: str, perp_path: str,
     res = run_all_strategies(option_path, perp_path, catalog={name: full[name]},
                              frequencies=(frequency,), initial_coin=initial_coin,
                              size_multiple=size_multiple, funding_annual_rate=funding_annual_rate,
+                             funding_series=funding_series, option_fee_bps=option_fee_bps,
                              max_snaps=max_snaps, verbose=verbose)
     return res[name]

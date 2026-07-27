@@ -42,7 +42,12 @@ def main() -> None:
     p.add_argument("--initial-coin", type=float, default=1.0)
     p.add_argument("--size-multiple", type=float, default=1.0)
     p.add_argument("--funding-annual-rate", type=float, default=0.0,
-                   help="constant annualised funding proxy (Eq 29); 0 = omitted")
+                   help="constant annualised funding fallback (Eq 29); 0 = omitted")
+    p.add_argument("--funding", default=None,
+                   help="path to a Deribit funding parquet (realised hourly Eq 29); "
+                        "overrides --funding-annual-rate")
+    p.add_argument("--option-fee-bps", type=float, default=0.0,
+                   help="explicit option fee on top of the bid/ask spread (default 0)")
     p.add_argument("--max-snaps", type=int, default=None, help="cap snapshots (smoke run)")
     p.add_argument("--csv", default=None, help="write the results table to this CSV")
     p.add_argument("--list", action="store_true", help="list catalog names and exit")
@@ -58,7 +63,8 @@ def main() -> None:
         results = R.run_all_strategies(
             args.options, args.perp, frequencies=freqs,
             initial_coin=args.initial_coin, size_multiple=args.size_multiple,
-            funding_annual_rate=args.funding_annual_rate,
+            funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
+            option_fee_bps=args.option_fee_bps,
             max_snaps=args.max_snaps, verbose=not args.quiet)
         table = RR.results_table(results, benchmark_name=args.coin)
         print()
@@ -71,7 +77,8 @@ def main() -> None:
     res = R.run_roll_backtest(
         args.options, args.perp, structure=args.structure, frequency=args.frequency,
         initial_coin=args.initial_coin, size_multiple=args.size_multiple,
-        funding_annual_rate=args.funding_annual_rate,
+        funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
+        option_fee_bps=args.option_fee_bps,
         max_snaps=args.max_snaps, verbose=not args.quiet)
     print()
     RR.print_summary(RR.summarize_rolls(res))

@@ -321,7 +321,83 @@ def _spot_at_expiry(snap: pd.DataFrame):
 def _init_state(name: str, legs_spec: list[tuple], frequency: str, grid: list[int]) -> dict:
     return {"name": name, "legs_spec": legs_spec, "frequency": frequency, "grid": grid,
             "next_idx": 0, "open_legs": None, "cum_pnl": 0.0, "hedge_notional": 0.0,
-            "last_hedge_F": None, "events": [], "rolls": [], "nav_rows": []}
+            "last_hedge_F": None, "last_hedge_ts": None,
+            "events": [], "rolls": [], "nav_rows": []}
+
+
+def _accrue(state: dict, ts_ms: int, F_perp: float, cfg) -> tuple[float, float]:
+    """Book perp P&L (Eq 26) + funding (Eq 29) on the notional held SINCE THE
+    LAST MARK, then advance the mark. Funding accrues pro-rata on the elapsed
+    time rather than assuming a fixed hour, so this is correct whether it's
+    called on the hourly grid or off-grid at a roll.
+
+    Calling this before the book changes at a roll is what stops the last
+    holding period's hedge P&L from being silently dropped."""
+    prev = state["hedge_notional"]
+    hedge_pnl = funding = 0.0
+    if state["last_hedge_F"] is not None and prev != 0.0:
+        hedge_pnl = (F_perp - state["last_hedge_F"]) / F_perp * prev
+        hours = max(ts_ms - (state["last_hedge_ts"] or ts_ms), 0) / MS_PER_HOUR
+        if cfg.funding_fn is not None:
+            funding = -cfg.funding_fn(ts_ms) * hours * prev
+        elif cfg.funding_rate:
+            funding = -(cfg.funding_rate / HOURS_PER_YEAR) * hours * prev
+        state["cum_pnl"] += hedge_pnl + funding
+    state["last_hedge_F"] = F_perp
+    state["last_hedge_ts"] = ts_ms
+    return hedge_pnl, funding
+
+
+def _compute_book(state: dict, snap_idx: pd.DataFrame, ts_ms: int) -> tuple[float, float]:
+    """(target hedge notional, unrealised mark) of the currently open book.
+    Pure — no side effects, so it can be called for both hedging and marking."""
+    target = unrealized = 0.0
+    if state["open_legs"] is None:
+        return target, unrealized
+    for leg in state["open_legs"]:
+        iv, F_exp, T, mark = leg["entry_iv"], leg["F_expiry"], None, None
+        if leg["instrument_id"] in snap_idx.index:
+            r = snap_idx.loc[leg["instrument_id"]]
+            if isinstance(r, pd.DataFrame):
+                r = r.iloc[0]
+            m = _mid_iv(r)
+            if np.isfinite(m):
+                iv = m
+            F_exp, T = float(r["underlying_price"]), float(r["t"])
+            mp = _mid_price(r)
+            if np.isfinite(mp) and mp > 0:
+                mark = mp
+        if T is None:  # instrument not quoted this snapshot: decay T off expiry
+            T = max((leg["expiration_timestamp_ms"] - ts_ms) / (MS_PER_DAY * 365.0), 1e-6)
+        if mark is None:  # no live mid: model-mark at current fwd/vol
+            mark = float(bs_pricing(F_exp, leg["strike"], T, iv, leg["option_type"] == "C")[0]) / F_exp
+        target += -(leg["contracts"] * _leg_net_delta(leg["strike"], leg["option_type"], F_exp, iv, T))
+        unrealized += leg["contracts"] * (mark - leg["entry_exec"])
+    return target, unrealized
+
+
+def _rehedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, cfg,
+             force: bool = False) -> tuple[float, float]:
+    """Move the perp hedge toward the book's target delta, subject to the
+    no-trade band, and charge 5bp on whatever is actually traded.
+
+    Band semantics: rebalance only once the delta drift exceeds
+    `hedge_band` x current Coin NAV — an ABSOLUTE tolerance in coin units. A
+    band relative to the notional itself would be meaningless for the
+    delta-neutral structures (straddles sit at target ~ 0, so any relative band
+    would trigger on every tick). `force=True` at a roll: the book just changed
+    wholesale, so it must be hedged regardless of the band.
+
+    Returns (rebalance_cost, unrealised_mark)."""
+    target, unrealized = _compute_book(state, snap_idx, ts_ms)
+    drift = abs(target - state["hedge_notional"])
+    nav = abs(cfg.initial_coin + state["cum_pnl"])
+    rebalance = 0.0
+    if force or cfg.hedge_band <= 0.0 or drift > cfg.hedge_band * nav:
+        rebalance = cfg.perp_cost_frac * drift
+        state["cum_pnl"] -= rebalance
+        state["hedge_notional"] = target
+    return rebalance, unrealized
 
 
 def _settle(state: dict, S_T: float, ts_ms: int, initial_coin: float) -> None:
@@ -355,74 +431,52 @@ def _open(state: dict, legs: list[dict], ts_ms: int, cfg) -> None:
                                      l["qty"], l["entry_mid"]) for l in legs]})
 
 
-def _do_rolls(state: dict, snap: pd.DataFrame, ts_ms: int,
-              perp_ts: np.ndarray, perp_close: np.ndarray, cfg) -> None:
+def _hedge_event(state: dict, ts_ms: int, hedge_pnl: float, funding: float,
+                 rebalance: float) -> None:
+    if hedge_pnl or funding or rebalance:
+        state["events"].append({"action": "hedge", "timestamp": ts_ms, "option_pnl": 0.0,
+                                "option_cost": 0.0, "hedge_pnl": hedge_pnl,
+                                "funding": funding, "rebalance_cost": rebalance})
+
+
+def _do_rolls(state: dict, snap: pd.DataFrame, snap_idx: pd.DataFrame, ts_ms: int,
+              F_perp: float, perp_ts: np.ndarray, perp_close: np.ndarray, cfg) -> None:
     grid = state["grid"]
     while state["next_idx"] < len(grid) and ts_ms >= grid[state["next_idx"]]:
         roll_ts = grid[state["next_idx"]]
+        # Book the hedge P&L + funding accrued on the position held up to this
+        # moment BEFORE the book changes. Previously the notional was zeroed and
+        # the mark reset without booking, silently discarding the final holding
+        # period's hedge P&L — the expiry hour, when the option's delta is at its
+        # most extreme, so the loss was both systematic and directional.
+        hedge_pnl, funding = _accrue(state, ts_ms, F_perp, cfg)
+        _hedge_event(state, ts_ms, hedge_pnl, funding, 0.0)
+
         if state["open_legs"] is not None:
             S_T = _spot_at_expiry(snap) or _perp_at(perp_ts, perp_close, roll_ts)
             _settle(state, S_T, roll_ts, cfg.initial_coin)
             state["open_legs"] = None
-            state["hedge_notional"] = 0.0
         if state["next_idx"] + 1 < len(grid):
             legs = _select_structure(snap, grid[state["next_idx"] + 1], state["legs_spec"])
             if legs is not None:
                 _open(state, legs, roll_ts, cfg)
         state["next_idx"] += 1
-        state["last_hedge_F"] = None  # reseed hedge on the new book
+
+        # Hedge the NEW book immediately rather than waiting for the next hour
+        # boundary (which left it naked for up to an hour every roll). The perp
+        # is NOT zeroed in between, so the cost charged here is the netted trade
+        # from the old hedge straight to the new one — what a desk would do when
+        # one expiry settles and the next is opened at the same moment.
+        rebalance, _ = _rehedge(state, snap_idx, ts_ms, cfg, force=True)
+        _hedge_event(state, ts_ms, 0.0, 0.0, rebalance)
 
 
 def _do_hedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, F_perp: float, cfg) -> None:
-    prev_notional = state["hedge_notional"]  # perp position held over the past hour
-    hedge_pnl = 0.0
-    if state["last_hedge_F"] is not None and prev_notional != 0.0:
-        hedge_pnl = (F_perp - state["last_hedge_F"]) / F_perp * prev_notional  # Eq 26
-        state["cum_pnl"] += hedge_pnl
-
-    target = 0.0
-    unrealized = 0.0  # mark-to-market of the open option book (Coin), at MID
-    if state["open_legs"] is not None:
-        for leg in state["open_legs"]:
-            iv, F_exp, T, mark = leg["entry_iv"], leg["F_expiry"], None, None
-            if leg["instrument_id"] in snap_idx.index:
-                r = snap_idx.loc[leg["instrument_id"]]
-                if isinstance(r, pd.DataFrame):
-                    r = r.iloc[0]
-                m = _mid_iv(r)
-                if np.isfinite(m):
-                    iv = m
-                F_exp, T = float(r["underlying_price"]), float(r["t"])
-                mp = _mid_price(r)
-                if np.isfinite(mp) and mp > 0:
-                    mark = mp
-            if T is None:  # instrument not quoted this snapshot: decay T off expiry
-                T = max((leg["expiration_timestamp_ms"] - ts_ms) / (MS_PER_DAY * 365.0), 1e-6)
-            if mark is None:  # no live mid: model-mark at current fwd/vol
-                px_usd = bs_pricing(F_exp, leg["strike"], T, iv, leg["option_type"] == "C")[0]
-                mark = float(px_usd) / F_exp
-            target += -(leg["contracts"] * _leg_net_delta(leg["strike"], leg["option_type"], F_exp, iv, T))
-            unrealized += leg["contracts"] * (mark - leg["entry_exec"])
-
-    rebalance = cfg.perp_cost_frac * abs(target - prev_notional)
-    # DeltaFunding (Eq 29): accrued on the position HELD over the past hour.
-    # A funding_fn returns Deribit's per-hour funding fraction (interest_1h)
-    # applied directly; a constant funding_rate is annualised and de-annualised.
-    # Sign convention (Deribit, paper Eqs 29-30): a long perp position pays
-    # funding when the rate is positive -> negative P&L.
-    funding = 0.0
-    if prev_notional != 0.0:
-        if cfg.funding_fn is not None:
-            funding = -cfg.funding_fn(ts_ms) * prev_notional
-        elif cfg.funding_rate:
-            funding = -(cfg.funding_rate / HOURS_PER_YEAR) * prev_notional
-    state["cum_pnl"] += funding - rebalance
-    if hedge_pnl or rebalance or funding:
-        state["events"].append({"action": "hedge", "timestamp": ts_ms, "option_pnl": 0.0,
-                                "option_cost": 0.0, "hedge_pnl": hedge_pnl, "funding": funding,
-                                "rebalance_cost": rebalance})
-    state["hedge_notional"] = target
-    state["last_hedge_F"] = F_perp
+    """Hourly mark: accrue perp P&L + funding on the held notional, then
+    rebalance toward the book's delta subject to the no-trade band."""
+    hedge_pnl, funding = _accrue(state, ts_ms, F_perp, cfg)
+    rebalance, unrealized = _rehedge(state, snap_idx, ts_ms, cfg)
+    _hedge_event(state, ts_ms, hedge_pnl, funding, rebalance)
     # NAV = starting coin + realised P&L + unrealised mark of the open book, so
     # the path is continuous hour-to-hour (the option no longer only "appears"
     # at settlement) — this is what makes daily vol/Sharpe/MaxDD meaningful.
@@ -439,7 +493,8 @@ def _finalize(state: dict, cfg) -> dict:
                        "initial_coin": cfg.initial_coin, "size_multiple": cfg.size_multiple,
                        "funding_annual_rate": cfg.funding_rate,
                        "option_fee_bps": cfg.opt_fee_frac * 10_000.0,
-                       "perp_cost_bps": PERP_COST_BPS, "execution": "bid/ask entry, mid MTM"}}
+                       "perp_cost_bps": PERP_COST_BPS, "hedge_band": cfg.hedge_band,
+                       "execution": "bid/ask entry, mid MTM"}}
 
 
 # --------------------------------------------------------------------------- #
@@ -461,7 +516,7 @@ def run_all_strategies(option_path: str, perp_path: str,
                        frequencies: tuple[str, ...] = ("weekly",),
                        initial_coin: float = 1.0, size_multiple: float = 1.0,
                        funding_annual_rate: float = 0.0, funding_series=None,
-                       option_fee_bps: float = 0.0,
+                       option_fee_bps: float = 0.0, hedge_band: float = 0.05,
                        max_snaps: int | None = None, verbose: bool = True) -> dict[str, dict]:
     """Backtest an entire catalog x frequencies in ONE pass over the option
     data. Returns {strategy_name: result_dict}; hand the whole dict to
@@ -471,13 +526,22 @@ def run_all_strategies(option_path: str, perp_path: str,
     Funding (Eq 29): pass `funding_series` = path to a Deribit funding parquet
     (see `utils.deribit_funding.fetch_funding`) for realised hourly funding — the
     faithful term. `funding_annual_rate` is a constant fallback used only when
-    `funding_series` is None."""
+    `funding_series` is None.
+
+    `hedge_band` (default 0.05): no-trade band on the delta hedge — rebalance
+    only once the drift exceeds 5% of Coin NAV, instead of forcing a trade every
+    hour. Hourly rebalancing of a short-dated ATM book is dominated by gamma
+    churn near expiry and measured at ~18% of gross option P&L on this data; the
+    paper itself notes desks rebalance within bands and that "optimised hedging
+    produces better risk-adjusted results" (§5.2). Set 0.0 to restore the
+    unconditional hourly rebalance."""
     catalog = catalog or build_catalog()
     cfg = types.SimpleNamespace(initial_coin=initial_coin, size_multiple=size_multiple,
                                 opt_fee_frac=option_fee_bps / 10_000.0,
                                 perp_cost_frac=PERP_COST_BPS / 10_000.0,
                                 funding_rate=funding_annual_rate,
-                                funding_fn=_resolve_funding(funding_series))
+                                funding_fn=_resolve_funding(funding_series),
+                                hedge_band=hedge_band)
 
     perp_ts, perp_close = _perp_series(perp_path)
     first_ts = next(_iter_snapshots(option_path, max_snaps=1))[0]
@@ -495,12 +559,21 @@ def run_all_strategies(option_path: str, perp_path: str,
     n = 0
     for ts_ms, snap in _iter_snapshots(option_path, max_snaps=max_snaps):
         n += 1
-        for st in states:
-            _do_rolls(st, snap, ts_ms, perp_ts, perp_close, cfg)
         hour = ts_ms // MS_PER_HOUR
-        if last_hour is None or hour != last_hour:
-            F_perp = _perp_at(perp_ts, perp_close, ts_ms)
-            snap_idx = snap.set_index("instrument_id")
+        need_hedge = last_hour is None or hour != last_hour
+        # Rolls now hedge the new book on the spot, so they need the indexed
+        # snapshot too — but building it costs real time on 240k snapshots, so
+        # only do it when something actually happens this snapshot.
+        need_roll = any(st["next_idx"] < len(st["grid"]) and ts_ms >= st["grid"][st["next_idx"]]
+                        for st in states)
+        if not (need_hedge or need_roll):
+            continue
+        F_perp = _perp_at(perp_ts, perp_close, ts_ms)
+        snap_idx = snap.set_index("instrument_id")
+        if need_roll:
+            for st in states:
+                _do_rolls(st, snap, snap_idx, ts_ms, F_perp, perp_ts, perp_close, cfg)
+        if need_hedge:
             for st in states:
                 _do_hedge(st, snap_idx, ts_ms, F_perp, cfg)
             last_hour = hour
@@ -518,7 +591,7 @@ def run_roll_backtest(option_path: str, perp_path: str,
                       structure: str = "Short Straddle", frequency: str = "weekly",
                       initial_coin: float = 1.0, size_multiple: float = 1.0,
                       funding_annual_rate: float = 0.0, funding_series=None,
-                      option_fee_bps: float = 0.0,
+                      option_fee_bps: float = 0.0, hedge_band: float = 0.05,
                       max_snaps: int | None = None, verbose: bool = True) -> dict:
     """Single-strategy wrapper on `run_all_strategies`. `structure` is a catalog
     name ("Short Straddle", "Long 25D Strangle", ...) or an old lowercase alias
@@ -531,5 +604,5 @@ def run_roll_backtest(option_path: str, perp_path: str,
                              frequencies=(frequency,), initial_coin=initial_coin,
                              size_multiple=size_multiple, funding_annual_rate=funding_annual_rate,
                              funding_series=funding_series, option_fee_bps=option_fee_bps,
-                             max_snaps=max_snaps, verbose=verbose)
+                             hedge_band=hedge_band, max_snaps=max_snaps, verbose=verbose)
     return res[name]

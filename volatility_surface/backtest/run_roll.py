@@ -48,6 +48,9 @@ def main() -> None:
                         "overrides --funding-annual-rate")
     p.add_argument("--option-fee-bps", type=float, default=0.0,
                    help="explicit option fee on top of the bid/ask spread (default 0)")
+    p.add_argument("--hedge-band", type=float, default=0.05,
+                   help="delta no-trade band as a fraction of Coin NAV (default 0.05); "
+                        "0 = rebalance every hour unconditionally")
     p.add_argument("--max-snaps", type=int, default=None, help="cap snapshots (smoke run)")
     p.add_argument("--csv", default=None, help="write the results table to this CSV")
     p.add_argument("--list", action="store_true", help="list catalog names and exit")
@@ -64,7 +67,7 @@ def main() -> None:
             args.options, args.perp, frequencies=freqs,
             initial_coin=args.initial_coin, size_multiple=args.size_multiple,
             funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
-            option_fee_bps=args.option_fee_bps,
+            option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
             max_snaps=args.max_snaps, verbose=not args.quiet)
         table = RR.results_table(results, benchmark_name=args.coin)
         print()
@@ -78,7 +81,7 @@ def main() -> None:
         args.options, args.perp, structure=args.structure, frequency=args.frequency,
         initial_coin=args.initial_coin, size_multiple=args.size_multiple,
         funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
-        option_fee_bps=args.option_fee_bps,
+        option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
         max_snaps=args.max_snaps, verbose=not args.quiet)
     print()
     RR.print_summary(RR.summarize_rolls(res))

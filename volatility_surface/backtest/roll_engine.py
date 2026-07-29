@@ -28,9 +28,16 @@ Reused from the rest of the project (so nothing drifts):
     to stay identical to `engine.py` (a ~1e-3 funding-basis term for 7-day
     options).
 
-Accounting: Coin-based (§5.1.2, Eqs 39-44) — Deribit-native, the measure the
-paper's headline figures use. USD accounting (Eqs 46-52) is a thin wrapper for
-a later phase.
+Accounting (`accounting=`): "coin" (default, §5.1.2 Eqs 39-44) is Deribit-native
+— the account is funded in coin, P&L accrues in coin, and the investor keeps a
+long exposure to the underlying through realised profits. "usd" (Eqs 46-52)
+funds in USD and swaps every coin increment into dollars at the spot prevailing
+when it accrues, which removes that exposure; option P&L becomes
+S_t V(t) - S_{t0} V(t0) (Eq 46) rather than V(t) - V(t0), so the FX move on the
+premium between opening and settlement is part of the result. Position sizing
+follows the book: N = Pi^BTC under coin, N = Pi^USD/S_t under USD. The paper
+finds risk-adjusted performance is close between the two (§5.2.4) — what really
+changes is beta to the coin.
 
 Execution & marking (more realistic than the paper's Assumption 5.1): each leg
 is TRADED across the real spread — a long leg buys at the ask, a short leg sells
@@ -163,14 +170,31 @@ def _last_friday_grid(start_ms: int, end_ms: int, quarterly: bool = False) -> li
     return out
 
 
+def _daily_0800_grid(start_ms: int, end_ms: int) -> list[int]:
+    """Every day at 08:00 UTC — Deribit lists daily expiries for the front few
+    days (verified on real chain data: 4 consecutive dailies), so a daily roll
+    settles this morning's expiry and opens tomorrow's 1-day option."""
+    d = dt.datetime.fromtimestamp(start_ms / 1000, dt.timezone.utc).replace(
+        hour=8, minute=0, second=0, microsecond=0)
+    while int(d.timestamp() * 1000) < start_ms:
+        d += dt.timedelta(days=1)
+    out = []
+    while int(d.timestamp() * 1000) <= end_ms:
+        out.append(int(d.timestamp() * 1000))
+        d += dt.timedelta(days=1)
+    return out
+
+
 def roll_grid(start_ms: int, end_ms: int, frequency: str) -> list[int]:
+    if frequency == "daily":
+        return _daily_0800_grid(start_ms, end_ms)
     if frequency == "weekly":
         return _friday_0800_grid(start_ms, end_ms)
     if frequency == "monthly":
         return _last_friday_grid(start_ms, end_ms, quarterly=False)
     if frequency == "quarterly":
         return _last_friday_grid(start_ms, end_ms, quarterly=True)
-    raise ValueError(f"unknown frequency {frequency!r} — weekly/monthly/quarterly")
+    raise ValueError(f"unknown frequency {frequency!r} — daily/weekly/monthly/quarterly")
 
 
 # --------------------------------------------------------------------------- #
@@ -292,6 +316,13 @@ def _select_structure(snap: pd.DataFrame, target_expiry_ms: float, legs_spec: li
     return legs
 
 
+def _acct(cfg, spot: float) -> float:
+    """Multiplier turning a Coin-denominated increment into the accounting
+    currency: 1 under Coin accounting, the prevailing spot under USD accounting
+    (Eqs 47/30 — each coin increment is swapped to USD as it accrues)."""
+    return float(spot) if cfg.usd else 1.0
+
+
 def _leg_net_delta(strike: float, option_type: str, F_expiry: float, iv: float, T: float) -> float:
     """Net (premium-adjusted) delta per contract, Coin units — Delta_k^BTC (Eq
     17), via `pricing_models.inverse_delta` under S=1 / K=strike/F."""
@@ -336,21 +367,25 @@ def _accrue(state: dict, ts_ms: int, F_perp: float, cfg) -> tuple[float, float]:
     prev = state["hedge_notional"]
     hedge_pnl = funding = 0.0
     if state["last_hedge_F"] is not None and prev != 0.0:
-        hedge_pnl = (F_perp - state["last_hedge_F"]) / F_perp * prev
+        fx = _acct(cfg, F_perp)  # 1 under Coin, spot under USD (Eqs 47/30)
+        hedge_pnl = (F_perp - state["last_hedge_F"]) / F_perp * prev * fx
         hours = max(ts_ms - (state["last_hedge_ts"] or ts_ms), 0) / MS_PER_HOUR
         if cfg.funding_fn is not None:
-            funding = -cfg.funding_fn(ts_ms) * hours * prev
+            funding = -cfg.funding_fn(ts_ms) * hours * prev * fx
         elif cfg.funding_rate:
-            funding = -(cfg.funding_rate / HOURS_PER_YEAR) * hours * prev
+            funding = -(cfg.funding_rate / HOURS_PER_YEAR) * hours * prev * fx
         state["cum_pnl"] += hedge_pnl + funding
     state["last_hedge_F"] = F_perp
     state["last_hedge_ts"] = ts_ms
     return hedge_pnl, funding
 
 
-def _compute_book(state: dict, snap_idx: pd.DataFrame, ts_ms: int) -> tuple[float, float]:
-    """(target hedge notional, unrealised mark) of the currently open book.
-    Pure — no side effects, so it can be called for both hedging and marking."""
+def _compute_book(state: dict, snap_idx: pd.DataFrame, ts_ms: int,
+                  spot: float, cfg) -> tuple[float, float]:
+    """(target hedge notional in COIN, unrealised mark in the ACCOUNTING ccy) of
+    the currently open book. Pure — no side effects, so it serves both hedging
+    and marking. The target stays in coin because the perp hedge is a coin
+    quantity regardless of which book funds it."""
     target = unrealized = 0.0
     if state["open_legs"] is None:
         return target, unrealized
@@ -372,11 +407,14 @@ def _compute_book(state: dict, snap_idx: pd.DataFrame, ts_ms: int) -> tuple[floa
         if mark is None:  # no live mid: model-mark at current fwd/vol
             mark = float(bs_pricing(F_exp, leg["strike"], T, iv, leg["option_type"] == "C")[0]) / F_exp
         target += -(leg["contracts"] * _leg_net_delta(leg["strike"], leg["option_type"], F_exp, iv, T))
-        unrealized += leg["contracts"] * (mark - leg["entry_exec"])
+        if cfg.usd:  # Eq 46 marked to today: S_t V(t) - S_{t0} V(t0)
+            unrealized += leg["contracts"] * (mark * spot - leg["entry_exec"] * leg["entry_spot"])
+        else:
+            unrealized += leg["contracts"] * (mark - leg["entry_exec"])
     return target, unrealized
 
 
-def _rehedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, cfg,
+def _rehedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, spot: float, cfg,
              force: bool = False) -> tuple[float, float]:
     """Move the perp hedge toward the book's target delta, subject to the
     no-trade band, and charge 5bp on whatever is actually traded.
@@ -389,39 +427,58 @@ def _rehedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, cfg,
     wholesale, so it must be hedged regardless of the band.
 
     Returns (rebalance_cost, unrealised_mark)."""
-    target, unrealized = _compute_book(state, snap_idx, ts_ms)
+    target, unrealized = _compute_book(state, snap_idx, ts_ms, spot, cfg)
     drift = abs(target - state["hedge_notional"])
-    nav = abs(cfg.initial_coin + state["cum_pnl"])
+    # The band compares coin against coin: `drift` is a coin delta, so the NAV
+    # it is measured against must be expressed in coin too (under USD accounting
+    # the book is carried in dollars).
+    nav = abs(cfg.initial_nav + state["cum_pnl"])
+    nav_coin = nav / spot if cfg.usd else nav
     rebalance = 0.0
-    if force or cfg.hedge_band <= 0.0 or drift > cfg.hedge_band * nav:
-        rebalance = cfg.perp_cost_frac * drift
+    if force or cfg.hedge_band <= 0.0 or drift > cfg.hedge_band * nav_coin:
+        rebalance = cfg.perp_cost_frac * drift * _acct(cfg, spot)
         state["cum_pnl"] -= rebalance
         state["hedge_notional"] = target
     return rebalance, unrealized
 
 
-def _settle(state: dict, S_T: float, ts_ms: int, initial_coin: float) -> None:
-    """Realise a held structure at expiry (Eq 39 with V(T,T)=payoff)."""
+def _settle(state: dict, S_T: float, ts_ms: int, cfg) -> None:
+    """Realise a held structure at expiry (Eq 39 with V(T,T)=payoff).
+
+    Under USD accounting this is Eq 46, N_k(S_t V_k(t) - S_{t0} V_k(t0)): each
+    side of the P&L is converted at the spot prevailing WHEN IT HAPPENED, not
+    both at today's — so the FX move on the premium between opening and
+    settlement is part of the result, which is the whole point of the USD book.
+    """
     opt = 0.0
     for leg in state["open_legs"]:
         payoff = _coin_payoff(leg["option_type"], leg["strike"], S_T)
-        opt += leg["contracts"] * (payoff - leg["entry_exec"])
+        if cfg.usd:
+            opt += leg["contracts"] * (payoff * S_T - leg["entry_exec"] * leg["entry_spot"])
+        else:
+            opt += leg["contracts"] * (payoff - leg["entry_exec"])
     state["cum_pnl"] += opt
     state["events"].append({"action": "settle", "timestamp": ts_ms, "option_pnl": opt,
                             "option_cost": 0.0, "hedge_pnl": 0.0, "funding": 0.0, "rebalance_cost": 0.0})
     state["rolls"].append({"action": "settle", "timestamp": ts_ms, "S_T": S_T,
-                           "option_pnl": opt, "coin_nav_after": initial_coin + state["cum_pnl"]})
+                           "option_pnl": opt, "nav_after": cfg.initial_nav + state["cum_pnl"]})
 
 
-def _open(state: dict, legs: list[dict], ts_ms: int, cfg) -> None:
-    """Open a structure sized to current NAV; pay entry costs (Eq 40 option cost)."""
-    N = (cfg.initial_coin + state["cum_pnl"]) * cfg.size_multiple
+def _open(state: dict, legs: list[dict], ts_ms: int, spot: float, cfg) -> None:
+    """Open a structure sized to current NAV; pay entry costs (Eq 40 option cost).
+
+    Sizing is always a CONTRACT count, which is a coin quantity: under Coin
+    accounting N = Pi^BTC (Eq 31), under USD accounting N = Pi^USD/S_t (§5.2.3)
+    — the same economic size, expressed from whichever book funds it."""
+    nav = cfg.initial_nav + state["cum_pnl"]
+    N = (nav / spot if cfg.usd else nav) * cfg.size_multiple
     cost = 0.0
     for leg in legs:
         leg["contracts"] = leg["qty"] * N
+        leg["entry_spot"] = float(spot)
         # Explicit fee ON TOP of the spread (which is already paid via entry@bid/ask
         # marked at mid). Defaults to 0 — set option_fee_bps to add exchange fees.
-        cost += cfg.opt_fee_frac * abs(leg["contracts"]) * leg["entry_mid"]
+        cost += cfg.opt_fee_frac * abs(leg["contracts"]) * leg["entry_mid"] * _acct(cfg, spot)
     state["cum_pnl"] -= cost
     state["open_legs"] = legs
     state["events"].append({"action": "open", "timestamp": ts_ms, "option_pnl": 0.0,
@@ -454,12 +511,19 @@ def _do_rolls(state: dict, snap: pd.DataFrame, snap_idx: pd.DataFrame, ts_ms: in
 
         if state["open_legs"] is not None:
             S_T = _spot_at_expiry(snap) or _perp_at(perp_ts, perp_close, roll_ts)
-            _settle(state, S_T, roll_ts, cfg.initial_coin)
+            _settle(state, S_T, roll_ts, cfg)
             state["open_legs"] = None
         if state["next_idx"] + 1 < len(grid):
-            legs = _select_structure(snap, grid[state["next_idx"] + 1], state["legs_spec"])
+            target_exp = grid[state["next_idx"] + 1]
+            # Tolerance must be under HALF the roll spacing, or a roll can match
+            # the neighbouring expiry instead of its own target — for daily rolls
+            # the just-settled expiry sits exactly one day away, i.e. right on a
+            # flat 1-day tolerance. Half-spacing makes the nearest-expiry match
+            # unambiguous at every frequency.
+            tol = min(MS_PER_DAY, (target_exp - roll_ts) // 2)
+            legs = _select_structure(snap, target_exp, state["legs_spec"], expiry_tol_ms=tol)
             if legs is not None:
-                _open(state, legs, roll_ts, cfg)
+                _open(state, legs, roll_ts, F_perp, cfg)
         state["next_idx"] += 1
 
         # Hedge the NEW book immediately rather than waiting for the next hour
@@ -467,7 +531,7 @@ def _do_rolls(state: dict, snap: pd.DataFrame, snap_idx: pd.DataFrame, ts_ms: in
         # is NOT zeroed in between, so the cost charged here is the netted trade
         # from the old hedge straight to the new one — what a desk would do when
         # one expiry settles and the next is opened at the same moment.
-        rebalance, _ = _rehedge(state, snap_idx, ts_ms, cfg, force=True)
+        rebalance, _ = _rehedge(state, snap_idx, ts_ms, F_perp, cfg, force=True)
         _hedge_event(state, ts_ms, 0.0, 0.0, rebalance)
 
 
@@ -475,13 +539,13 @@ def _do_hedge(state: dict, snap_idx: pd.DataFrame, ts_ms: int, F_perp: float, cf
     """Hourly mark: accrue perp P&L + funding on the held notional, then
     rebalance toward the book's delta subject to the no-trade band."""
     hedge_pnl, funding = _accrue(state, ts_ms, F_perp, cfg)
-    rebalance, unrealized = _rehedge(state, snap_idx, ts_ms, cfg)
+    rebalance, unrealized = _rehedge(state, snap_idx, ts_ms, F_perp, cfg)
     _hedge_event(state, ts_ms, hedge_pnl, funding, rebalance)
     # NAV = starting coin + realised P&L + unrealised mark of the open book, so
     # the path is continuous hour-to-hour (the option no longer only "appears"
     # at settlement) — this is what makes daily vol/Sharpe/MaxDD meaningful.
     state["nav_rows"].append({"timestamp": ts_ms,
-                              "coin_nav": cfg.initial_coin + state["cum_pnl"] + unrealized,
+                              "coin_nav": cfg.initial_nav + state["cum_pnl"] + unrealized,
                               "cum_pnl": state["cum_pnl"], "unrealized": unrealized,
                               "coin_px": F_perp})
 
@@ -491,6 +555,8 @@ def _finalize(state: dict, cfg) -> dict:
             "rolls": state["rolls"],
             "params": {"structure": state["name"], "frequency": state["frequency"],
                        "initial_coin": cfg.initial_coin, "size_multiple": cfg.size_multiple,
+                       "accounting": cfg.accounting, "initial_nav": cfg.initial_nav,
+                       "nav_unit": "USD" if cfg.usd else "coin",
                        "funding_annual_rate": cfg.funding_rate,
                        "option_fee_bps": cfg.opt_fee_frac * 10_000.0,
                        "perp_cost_bps": PERP_COST_BPS, "hedge_band": cfg.hedge_band,
@@ -517,6 +583,7 @@ def run_all_strategies(option_path: str, perp_path: str,
                        initial_coin: float = 1.0, size_multiple: float = 1.0,
                        funding_annual_rate: float = 0.0, funding_series=None,
                        option_fee_bps: float = 0.0, hedge_band: float = 0.05,
+                       accounting: str = "coin", initial_usd: float | None = None,
                        max_snaps: int | None = None, verbose: bool = True) -> dict[str, dict]:
     """Backtest an entire catalog x frequencies in ONE pass over the option
     data. Returns {strategy_name: result_dict}; hand the whole dict to
@@ -536,7 +603,10 @@ def run_all_strategies(option_path: str, perp_path: str,
     produces better risk-adjusted results" (§5.2). Set 0.0 to restore the
     unconditional hourly rebalance."""
     catalog = catalog or build_catalog()
+    if accounting not in ("coin", "usd"):
+        raise ValueError(f"accounting must be 'coin' or 'usd', got {accounting!r}")
     cfg = types.SimpleNamespace(initial_coin=initial_coin, size_multiple=size_multiple,
+                                usd=(accounting == "usd"), accounting=accounting,
                                 opt_fee_frac=option_fee_bps / 10_000.0,
                                 perp_cost_frac=PERP_COST_BPS / 10_000.0,
                                 funding_rate=funding_annual_rate,
@@ -546,6 +616,16 @@ def run_all_strategies(option_path: str, perp_path: str,
     perp_ts, perp_close = _perp_series(perp_path)
     first_ts = next(_iter_snapshots(option_path, max_snaps=1))[0]
     end_ts = int(perp_ts[-1])
+
+    # The account's starting value, in whichever currency funds it. Under USD
+    # accounting the paper sets D_0^USD = S_0 (the price of one coin at
+    # inception, §5.2.3) so the two books start economically identical and their
+    # returns are directly comparable.
+    S0 = _perp_at(perp_ts, perp_close, first_ts)
+    cfg.initial_nav = (
+        (initial_usd if initial_usd is not None else S0 * initial_coin)
+        if cfg.usd else initial_coin
+    )
 
     multi_freq = len(frequencies) > 1
     states: list[dict] = []
@@ -583,7 +663,7 @@ def run_all_strategies(option_path: str, perp_path: str,
 
     for st in states:
         if st["open_legs"] is not None:
-            _settle(st, _perp_at(perp_ts, perp_close, ts_ms), ts_ms, cfg.initial_coin)
+            _settle(st, _perp_at(perp_ts, perp_close, ts_ms), ts_ms, cfg)
     return {st["name"]: _finalize(st, cfg) for st in states}
 
 
@@ -592,6 +672,7 @@ def run_roll_backtest(option_path: str, perp_path: str,
                       initial_coin: float = 1.0, size_multiple: float = 1.0,
                       funding_annual_rate: float = 0.0, funding_series=None,
                       option_fee_bps: float = 0.0, hedge_band: float = 0.05,
+                      accounting: str = "coin", initial_usd: float | None = None,
                       max_snaps: int | None = None, verbose: bool = True) -> dict:
     """Single-strategy wrapper on `run_all_strategies`. `structure` is a catalog
     name ("Short Straddle", "Long 25D Strangle", ...) or an old lowercase alias
@@ -604,5 +685,6 @@ def run_roll_backtest(option_path: str, perp_path: str,
                              frequencies=(frequency,), initial_coin=initial_coin,
                              size_multiple=size_multiple, funding_annual_rate=funding_annual_rate,
                              funding_series=funding_series, option_fee_bps=option_fee_bps,
-                             hedge_band=hedge_band, max_snaps=max_snaps, verbose=verbose)
+                             hedge_band=hedge_band, accounting=accounting,
+                             initial_usd=initial_usd, max_snaps=max_snaps, verbose=verbose)
     return res[name]

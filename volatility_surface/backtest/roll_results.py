@@ -75,7 +75,9 @@ def summarize_rolls(result: dict) -> dict:
     """Headline performance + regression + P&L attribution for one backtest."""
     nav = result["nav"]
     daily = _daily_last(nav, "coin_nav") if not nav.empty else pd.Series(dtype=float)
-    m = {"structure": result["params"]["structure"], "frequency": result["params"]["frequency"]}
+    m = {"structure": result["params"]["structure"], "frequency": result["params"]["frequency"],
+         "accounting": result["params"].get("accounting", "coin"),
+         "nav_unit": result["params"].get("nav_unit", "coin")}
     m.update(_perf_stats(daily))
     m["final_nav_coin"] = m.pop("final")
     m["alpha_an"], m["beta"], m["r2"] = _regress(nav)
@@ -150,10 +152,11 @@ def print_summary(metrics: dict) -> None:
     print(f"  Max drawdown : {metrics['max_dd']:.1%}")
     print(f"  Skew (daily) : {metrics['skew']:+.2f}")
     print(f"  alpha_AN/beta/R2 : {metrics['alpha_an']:+.1%} / {metrics['beta']:.2f} / {metrics['r2']:.0%}")
-    print(f"  Final NAV    : {metrics['final_nav_coin']:.4f} coin")
+    print(f"  Final NAV    : {metrics['final_nav_coin']:.4f} {metrics.get('nav_unit', 'coin')}"
+          f"   [{metrics.get('accounting', 'coin')} accounting]")
     a = metrics.get("attribution")
     if a:
-        print("  P&L attribution (coin):")
+        print(f"  P&L attribution ({metrics.get('nav_unit', 'coin')}):")
         print(f"    option premium : {a['option_pnl']:+.4f}")
         print(f"    option cost    : -{a['option_cost']:.4f}")
         print(f"    delta-hedge    : {a['hedge_pnl']:+.4f}")

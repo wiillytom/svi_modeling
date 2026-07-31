@@ -222,6 +222,8 @@ def bulk_concat(root: str | list[str], out_path: str, filter_rows: bool = True,
 
     writer: pq.ParquetWriter | None = None
     schema: pa.Schema | None = None
+    col_order: list[str] | None = None   # pinned from the first batch, see below
+    dropped_cols: set[str] = set()
     n_rows = 0
     n_skipped = 0
     t0 = time.time()
@@ -239,8 +241,32 @@ def bulk_concat(root: str | list[str], out_path: str, filter_rows: bool = True,
                 continue
 
             batch_df = pd.concat(frames, ignore_index=True)
-            table = pa.Table.from_pandas(batch_df, preserve_index=False)
 
+            # Column ORDER is not stable across the raw CSVs (observed on the
+            # 2024 dump: `volume`/`interest_rate` swap places between files).
+            # pyarrow's cast matches fields positionally and refuses a reordered
+            # schema, so pin the first batch's order and reindex every later one
+            # onto it — otherwise the run dies mid-way with "Target schema's
+            # field names are not matching".
+            if col_order is None:
+                col_order = list(batch_df.columns)
+            else:
+                missing = [c for c in col_order if c not in batch_df.columns]
+                extra = [c for c in batch_df.columns if c not in col_order]
+                if missing:
+                    for c in missing:
+                        batch_df[c] = pd.NA
+                if extra:
+                    # A column absent from the first batch can't be added to an
+                    # already-open writer; drop it, but say so once per name.
+                    for c in extra:
+                        if c not in dropped_cols:
+                            print(f"[bulk_concat] column {c!r} absent from the first "
+                                  f"batch's schema — dropped for the whole file")
+                            dropped_cols.add(c)
+                batch_df = batch_df[col_order]
+
+            table = pa.Table.from_pandas(batch_df, preserve_index=False)
             if writer is None:
                 schema = table.schema
                 writer = pq.ParquetWriter(out_path, schema)

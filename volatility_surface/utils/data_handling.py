@@ -165,8 +165,14 @@ def clean_df(path: str, filter_rows: bool = True):
     clean_df['t'] = (clean_df['expiration_timestamp_ms']-clean_df['creation_timestamp_x'])/(3.6e6*24*365)
     clean_df['k'] = np.log(clean_df['strike']/clean_df['underlying_price'])
     clean_df['w'] = clean_df['mark_iv']**2 * clean_df['t']
-    n_d1 = norm.pdf(-clean_df['k']/np.sqrt(clean_df['w']) + np.sqrt(clean_df['w'])/2) #Gatheral d1 formula, equivalent to classical one
-    clean_df['vega'] = n_d1*np.sqrt(clean_df['t']) # Vega is to be multiplied by 1 vol point; Since we express vol as decimal, this is the adequate format
+    # An already-expired contract still quoted in the snapshot has t<0, hence
+    # w<0, hence sqrt(w)=NaN — a legitimate outcome (the row is dropped by the
+    # bid_iv/ask_iv dropna below), but numpy warns per call, which on a bulk run
+    # over tens of thousands of files buries every real message. Silence the
+    # expected warning rather than the rows.
+    with np.errstate(invalid='ignore', divide='ignore'):
+        n_d1 = norm.pdf(-clean_df['k']/np.sqrt(clean_df['w']) + np.sqrt(clean_df['w'])/2) #Gatheral d1 formula, equivalent to classical one
+        clean_df['vega'] = n_d1*np.sqrt(clean_df['t']) # Vega is to be multiplied by 1 vol point; Since we express vol as decimal, this is the adequate format
     #if we expressed vol as a percentage, we would divide vega by 100: e.g. 0.42 vol, 0.3 vega <=> 42 vol, 0.003 vega
 
     if filter_rows:

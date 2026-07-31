@@ -56,7 +56,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from volatility_surface.utils.data_handling import clean_df
+from volatility_surface.utils.data_handling import _TS_ALIASES, clean_df
 
 
 # --------------------------------------------------------------------------- #
@@ -92,10 +92,12 @@ def _ts_from_csv(path: str) -> dt.datetime | None:
     source, used when the filename can't be parsed. Reads one row, not the file."""
     try:
         head = pd.read_csv(path, nrows=1)
-        if head.empty or "creation_timestamp_x" not in head.columns:
+        if head.empty:
             return None
-        return dt.datetime.fromtimestamp(
-            float(head["creation_timestamp_x"].iloc[0]) / 1000.0, dt.timezone.utc)
+        col = next((c for c in _TS_ALIASES if c in head.columns), None)
+        if col is None:  # 2024 dumps name it `creation_timestamp`, see _TS_ALIASES
+            return None
+        return dt.datetime.fromtimestamp(float(head[col].iloc[0]) / 1000.0, dt.timezone.utc)
     except Exception:
         return None
 

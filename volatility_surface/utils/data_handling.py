@@ -15,6 +15,40 @@ from scipy.stats import norm
 from volatility_surface.core.pricing.volatility_dataframe import implied_volatility_dataframe, add_bid_ask_iv
 from volatility_surface.core.pricing.pricing_models import bs_delta, bs_inverse_delta
 
+#: Deribit's snapshot-time column is named `creation_timestamp_x` in the
+#: 2025+ dumps but plain `creation_timestamp` in the 2024 ones (the `_x` suffix
+#: is a pandas merge artefact that only later exports carry). Everything
+#: downstream — clean_df, _clean_df_pl_core, roll_engine's snapshot grouping —
+#: keys off `creation_timestamp_x`, so the alias is resolved once, at read time,
+#: rather than special-cased in every consumer.
+_TS_ALIASES = ("creation_timestamp_x", "creation_timestamp")
+
+
+def _normalise_ts_column_pd(df):
+    """Rename whichever snapshot-time alias this file uses to
+    `creation_timestamp_x`. Raises if none is present — a file with no snapshot
+    time is unusable, and failing here names the problem instead of letting an
+    AttributeError surface deep in the feature block."""
+    if "creation_timestamp_x" in df.columns:
+        return df
+    for alt in _TS_ALIASES[1:]:
+        if alt in df.columns:
+            return df.rename(columns={alt: "creation_timestamp_x"})
+    raise KeyError(
+        f"no snapshot-time column found (tried {_TS_ALIASES}); got {list(df.columns)[:12]}")
+
+
+def _normalise_ts_column_pl(df: 'pl.DataFrame') -> 'pl.DataFrame':
+    """Polars counterpart of `_normalise_ts_column_pd`."""
+    if "creation_timestamp_x" in df.columns:
+        return df
+    for alt in _TS_ALIASES[1:]:
+        if alt in df.columns:
+            return df.rename({alt: "creation_timestamp_x"})
+    raise KeyError(
+        f"no snapshot-time column found (tried {_TS_ALIASES}); got {df.columns[:12]}")
+
+
 def clean_df(path: str, filter_rows: bool = True):
     """Cleans the market microstructure data
     #See if we only take otm options ? 'c' & k>0 otm calls, 'p' & k<0 otm puts
@@ -32,6 +66,7 @@ def clean_df(path: str, filter_rows: bool = True):
     df = pd.read_csv(path)
     if df.empty:
         return df
+    df = _normalise_ts_column_pd(df)   # 2024 dumps use `creation_timestamp`
 
     # Grab the snapshot timestamp from the raw frame, before any filtering —
     # a snapshot with zero rows surviving the no-arb boundary filter is a
@@ -117,6 +152,7 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
     # normalise once up front rather than special-casing each check.
     df = df.with_columns(pl.col('option_type').str.slice(0, 1).str.to_uppercase().alias('option_type'))
 
+    df = _normalise_ts_column_pl(df)   # 2024 dumps use `creation_timestamp`
     df = df.sort('creation_timestamp_x')
     new_snapshot = pl.col('creation_timestamp_x').diff().fill_null(snapshot_gap_ms + 1) > snapshot_gap_ms
     df = df.with_columns(new_snapshot.cast(pl.Int64).cum_sum().alias('_snapshot_id'))
@@ -278,9 +314,16 @@ def clean_bulk_parquet_chunked(path: str, out_dir: str, filter_rows: bool = True
     """
     os.makedirs(out_dir, exist_ok=True)
     lf = pl.scan_parquet(path)
+    # The windowing below slices on the raw file's own column, before
+    # `_clean_df_pl_core` gets a chance to normalise the alias, so resolve the
+    # name here too (2024 dumps: `creation_timestamp`).
+    schema_cols = lf.collect_schema().names()
+    ts_col = next((c for c in _TS_ALIASES if c in schema_cols), None)
+    if ts_col is None:
+        raise KeyError(f"no snapshot-time column found (tried {_TS_ALIASES}) in {path}")
     bounds = lf.select(
-        pl.col('creation_timestamp_x').min().alias('lo'),
-        pl.col('creation_timestamp_x').max().alias('hi'),
+        pl.col(ts_col).min().alias('lo'),
+        pl.col(ts_col).max().alias('hi'),
     ).collect()
     if bounds.is_empty() or bounds['lo'][0] is None:
         return
@@ -292,7 +335,7 @@ def clean_bulk_parquet_chunked(path: str, out_dir: str, filter_rows: bool = True
     while start <= hi_ms:
         end = start + window_ms
         chunk = lf.filter(
-            (pl.col('creation_timestamp_x') >= start) & (pl.col('creation_timestamp_x') < end)
+            (pl.col(ts_col) >= start) & (pl.col(ts_col) < end)
         ).collect()
         if not chunk.is_empty():
             cleaned = _clean_df_pl_core(chunk, filter_rows=filter_rows, snapshot_gap_ms=snapshot_gap_ms, otm_only=otm_only)

@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 # Anchor to the script's own location, works both as script and in notebooks
@@ -15,38 +16,108 @@ from scipy.stats import norm
 from volatility_surface.core.pricing.volatility_dataframe import implied_volatility_dataframe, add_bid_ask_iv
 from volatility_surface.core.pricing.pricing_models import bs_delta, bs_inverse_delta
 
-#: Deribit's snapshot-time column is named `creation_timestamp_x` in the
-#: 2025+ dumps but plain `creation_timestamp` in the 2024 ones (the `_x` suffix
-#: is a pandas merge artefact that only later exports carry). Everything
-#: downstream — clean_df, _clean_df_pl_core, roll_engine's snapshot grouping —
-#: keys off `creation_timestamp_x`, so the alias is resolved once, at read time,
-#: rather than special-cased in every consumer.
+# --------------------------------------------------------------------------- #
+# Schema normalisation (2024 vs 2025+ Deribit dumps)
+# --------------------------------------------------------------------------- #
+# The 2025+ exports were built by merging the ticker feed with the instruments
+# endpoint, which is what gives them `strike`, `option_type`,
+# `expiration_timestamp`, `instrument_id` — and the `_x` suffix on
+# `creation_timestamp_x` (a pandas merge collision artefact). The 2024 dumps are
+# the raw ticker feed: they carry `creation_timestamp` and `instrument_name` but
+# none of the split-out contract fields.
+#
+# Deribit's instrument_name encodes all of them ("ETH-27DEC24-3000-C"), and the
+# expiry token is already in the `%d%b%y` form `clean_df` parses, so the 2024
+# schema is fully recoverable. Resolving it once here keeps every consumer
+# (clean_df, _clean_df_pl_core, roll_engine) on a single column vocabulary.
 _TS_ALIASES = ("creation_timestamp_x", "creation_timestamp")
 
+#: CURRENCY-DDMMMYY-STRIKE-C/P. Futures and perpetuals ("ETH-PERPETUAL",
+#: "ETH-27DEC24") have fewer tokens and are dropped — they are not options.
+_INSTRUMENT_RE = re.compile(r"^[A-Z]+-(\d{1,2}[A-Z]{3}\d{2})-([0-9.]+)-([CP])$")
 
-def _normalise_ts_column_pd(df):
-    """Rename whichever snapshot-time alias this file uses to
-    `creation_timestamp_x`. Raises if none is present — a file with no snapshot
-    time is unusable, and failing here names the problem instead of letting an
-    AttributeError surface deep in the feature block."""
-    if "creation_timestamp_x" in df.columns:
-        return df
-    for alt in _TS_ALIASES[1:]:
-        if alt in df.columns:
-            return df.rename(columns={alt: "creation_timestamp_x"})
-    raise KeyError(
-        f"no snapshot-time column found (tried {_TS_ALIASES}); got {list(df.columns)[:12]}")
+#: What everything downstream needs to exist by the end of normalisation.
+_REQUIRED = ("creation_timestamp_x", "strike", "option_type", "expiration_timestamp",
+             "underlying_price", "bid_price", "ask_price", "mark_iv")
 
 
-def _normalise_ts_column_pl(df: 'pl.DataFrame') -> 'pl.DataFrame':
-    """Polars counterpart of `_normalise_ts_column_pd`."""
-    if "creation_timestamp_x" in df.columns:
-        return df
-    for alt in _TS_ALIASES[1:]:
-        if alt in df.columns:
-            return df.rename({alt: "creation_timestamp_x"})
-    raise KeyError(
-        f"no snapshot-time column found (tried {_TS_ALIASES}); got {df.columns[:12]}")
+def _rename_ts(cols) -> str | None:
+    return next((c for c in _TS_ALIASES if c in cols), None)
+
+
+def _normalise_schema_pd(df):
+    """Bring a raw Deribit snapshot frame to the project's column vocabulary,
+    whatever export vintage it came from.
+
+    Renames the snapshot-time alias, and — when the contract fields are absent
+    (2024) — derives `expiration_timestamp` / `strike` / `option_type` /
+    `instrument_id` from `instrument_name`. Rows whose name is not an option
+    (perpetuals, futures) are dropped. Raises listing what is still missing, so
+    an unexpected vintage fails by name here instead of as a bare KeyError deep
+    inside the feature block.
+    """
+    ts = _rename_ts(df.columns)
+    if ts is None:
+        raise KeyError(f"no snapshot-time column (tried {_TS_ALIASES}); got {list(df.columns)[:15]}")
+    if ts != "creation_timestamp_x":
+        df = df.rename(columns={ts: "creation_timestamp_x"})
+
+    contract_cols = ("expiration_timestamp", "strike", "option_type")
+    if not all(c in df.columns for c in contract_cols):
+        if "instrument_name" not in df.columns:
+            raise KeyError(
+                f"missing {[c for c in contract_cols if c not in df.columns]} and no "
+                f"`instrument_name` to derive them from; got {list(df.columns)[:15]}")
+        parsed = df["instrument_name"].astype(str).str.extract(_INSTRUMENT_RE)
+        keep = parsed[0].notna()
+        df = df.loc[keep].copy()
+        parsed = parsed.loc[keep]
+        df["expiration_timestamp"] = parsed[0]           # '27DEC24', the %d%b%y clean_df parses
+        df["strike"] = parsed[1].astype(float)
+        df["option_type"] = parsed[2]
+    if "instrument_id" not in df.columns and "instrument_name" in df.columns:
+        # instrument_name is itself a stable unique key — roll_engine only needs
+        # it to track a held position across snapshots.
+        df["instrument_id"] = df["instrument_name"]
+
+    missing = [c for c in _REQUIRED if c not in df.columns]
+    if missing:
+        raise KeyError(f"missing required columns {missing} after normalisation; "
+                       f"got {list(df.columns)[:15]}")
+    return df
+
+
+def _normalise_schema_pl(df: 'pl.DataFrame') -> 'pl.DataFrame':
+    """Polars counterpart of `_normalise_schema_pd`."""
+    ts = _rename_ts(df.columns)
+    if ts is None:
+        raise KeyError(f"no snapshot-time column (tried {_TS_ALIASES}); got {df.columns[:15]}")
+    if ts != "creation_timestamp_x":
+        df = df.rename({ts: "creation_timestamp_x"})
+
+    contract_cols = ("expiration_timestamp", "strike", "option_type")
+    if not all(c in df.columns for c in contract_cols):
+        if "instrument_name" not in df.columns:
+            raise KeyError(
+                f"missing {[c for c in contract_cols if c not in df.columns]} and no "
+                f"`instrument_name` to derive them from; got {df.columns[:15]}")
+        df = (df.with_columns(
+                  pl.col("instrument_name").cast(pl.Utf8)
+                    .str.extract_groups(_INSTRUMENT_RE.pattern).alias("_p"))
+                .filter(pl.col("_p").struct.field("1").is_not_null())
+                .with_columns(
+                    pl.col("_p").struct.field("1").alias("expiration_timestamp"),
+                    pl.col("_p").struct.field("2").cast(pl.Float64).alias("strike"),
+                    pl.col("_p").struct.field("3").alias("option_type"))
+                .drop("_p"))
+    if "instrument_id" not in df.columns and "instrument_name" in df.columns:
+        df = df.with_columns(pl.col("instrument_name").alias("instrument_id"))
+
+    missing = [c for c in _REQUIRED if c not in df.columns]
+    if missing:
+        raise KeyError(f"missing required columns {missing} after normalisation; "
+                       f"got {df.columns[:15]}")
+    return df
 
 
 def clean_df(path: str, filter_rows: bool = True):
@@ -66,7 +137,7 @@ def clean_df(path: str, filter_rows: bool = True):
     df = pd.read_csv(path)
     if df.empty:
         return df
-    df = _normalise_ts_column_pd(df)   # 2024 dumps use `creation_timestamp`
+    df = _normalise_schema_pd(df)   # 2024 dumps: creation_timestamp + instrument_name only
 
     # Grab the snapshot timestamp from the raw frame, before any filtering —
     # a snapshot with zero rows surviving the no-arb boundary filter is a
@@ -152,7 +223,7 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
     # normalise once up front rather than special-casing each check.
     df = df.with_columns(pl.col('option_type').str.slice(0, 1).str.to_uppercase().alias('option_type'))
 
-    df = _normalise_ts_column_pl(df)   # 2024 dumps use `creation_timestamp`
+    df = _normalise_schema_pl(df)   # 2024 dumps: creation_timestamp + instrument_name only
     df = df.sort('creation_timestamp_x')
     new_snapshot = pl.col('creation_timestamp_x').diff().fill_null(snapshot_gap_ms + 1) > snapshot_gap_ms
     df = df.with_columns(new_snapshot.cast(pl.Int64).cum_sum().alias('_snapshot_id'))

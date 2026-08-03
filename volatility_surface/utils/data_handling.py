@@ -80,6 +80,13 @@ def _normalise_schema_pd(df):
         # it to track a held position across snapshots.
         df["instrument_id"] = df["instrument_name"]
 
+    # option_type convention differs by vintage: the raw ticker CSVs (and the
+    # value derived from instrument_name above) use 'C'/'P', while the exports
+    # merged with the instruments endpoint carry Deribit's own 'call'/'put'.
+    # Every downstream filter compares against 'C'/'P' exactly, so a 'call'/'put'
+    # file silently filtered to zero rows — normalise once, here.
+    df["option_type"] = df["option_type"].astype(str).str[0].str.upper()
+
     missing = [c for c in _REQUIRED if c not in df.columns]
     if missing:
         raise KeyError(f"missing required columns {missing} after normalisation; "
@@ -112,6 +119,10 @@ def _normalise_schema_pl(df: 'pl.DataFrame') -> 'pl.DataFrame':
                 .drop("_p"))
     if "instrument_id" not in df.columns and "instrument_name" in df.columns:
         df = df.with_columns(pl.col("instrument_name").alias("instrument_id"))
+
+    # See the pandas counterpart: 'call'/'put' vs 'C'/'P' by export vintage.
+    df = df.with_columns(
+        pl.col("option_type").cast(pl.Utf8).str.slice(0, 1).str.to_uppercase().alias("option_type"))
 
     missing = [c for c in _REQUIRED if c not in df.columns]
     if missing:
@@ -156,8 +167,21 @@ def clean_df(path: str, filter_rows: bool = True):
     #Timestamp standardisation
     clean_df['creation_timestamp_x'] = ts
     clean_df['creation_timestamp_x'] = clean_df['creation_timestamp_x'] #2h, paris = gmt +2
-    clean_df['expiration_timestamp'] = pd.to_datetime(clean_df['expiration_timestamp'], format='%d%b%y')+pd.Timedelta(hours=8)
-    clean_df['expiration_timestamp_ms'] = clean_df['expiration_timestamp'].astype('int64') / 10**6
+    # Same three `expiration_timestamp` schemas `_clean_df_pl_core` documents:
+    #   1. bare expiry DATE string ("5JUN26") — Deribit settles at 08:00 UTC, so
+    #      +8h after parsing gives the real settlement instant;
+    #   2. already-resolved epoch-ms int (the merged/instruments-endpoint
+    #      exports) — settlement time is baked in, adding +8h double-counts it;
+    #   3. a native datetime column.
+    exp_raw = clean_df['expiration_timestamp']
+    if pd.api.types.is_numeric_dtype(exp_raw):
+        clean_df['expiration_timestamp_ms'] = exp_raw.astype('float64')
+        clean_df['expiration_timestamp'] = pd.to_datetime(exp_raw, unit='ms')
+    elif pd.api.types.is_datetime64_any_dtype(exp_raw):
+        clean_df['expiration_timestamp_ms'] = exp_raw.astype('int64') / 10**6
+    else:
+        clean_df['expiration_timestamp'] = pd.to_datetime(exp_raw, format='%d%b%y') + pd.Timedelta(hours=8)
+        clean_df['expiration_timestamp_ms'] = clean_df['expiration_timestamp'].astype('int64') / 10**6
     clean_df['file_timestamp'] = pd.to_datetime(clean_df['creation_timestamp_x'], unit='ms').dt.strftime('%Y-%m-%d %H:%M')
 
     #Features
@@ -222,14 +246,11 @@ def _clean_df_pl_core(df: pl.DataFrame, filter_rows: bool = True, snapshot_gap_m
     if df.is_empty():
         return df
 
-    # option_type convention differs by data source: the live gatherer's raw
-    # CSVs use single-letter 'C'/'P'; a bulk historical dump can instead use
-    # full words 'call'/'put' (confirmed on the real Jan-Jun 2025 file). Every
-    # downstream filter/check here compares against 'C'/'P' exactly, so
-    # normalise once up front rather than special-casing each check.
-    df = df.with_columns(pl.col('option_type').str.slice(0, 1).str.to_uppercase().alias('option_type'))
-
-    df = _normalise_schema_pl(df)   # 2024 dumps: creation_timestamp + instrument_name only
+    # Schema + option_type ('call'/'put' vs 'C'/'P') normalisation both happen
+    # inside `_normalise_schema_pl`. It must run FIRST: the 2024 raw-ticker
+    # vintage has no `option_type` column at all (it is derived there from
+    # `instrument_name`), so touching that column beforehand raised.
+    df = _normalise_schema_pl(df)
     df = df.sort('creation_timestamp_x')
     new_snapshot = pl.col('creation_timestamp_x').diff().fill_null(snapshot_gap_ms + 1) > snapshot_gap_ms
     df = df.with_columns(new_snapshot.cast(pl.Int64).cum_sum().alias('_snapshot_id'))

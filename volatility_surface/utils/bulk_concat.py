@@ -237,8 +237,15 @@ def diagnose_file(path: str) -> None:
         return
 
     d = d.copy()
-    exp = pd.to_datetime(d["expiration_timestamp"], format="%d%b%y") + pd.Timedelta(hours=8)
-    d["t"] = (exp.astype("int64") / 1e6 - float(df["creation_timestamp_x"].iloc[0])) / (3.6e6 * 24 * 365)
+    # Same three expiry schemas clean_df handles (date string / epoch ms / datetime).
+    e = d["expiration_timestamp"]
+    if pd.api.types.is_numeric_dtype(e):
+        exp_ms = e.astype("float64")
+    elif pd.api.types.is_datetime64_any_dtype(e):
+        exp_ms = e.astype("int64") / 1e6
+    else:
+        exp_ms = (pd.to_datetime(e, format="%d%b%y") + pd.Timedelta(hours=8)).astype("int64") / 1e6
+    d["t"] = (exp_ms - float(df["creation_timestamp_x"].iloc[0])) / (3.6e6 * 24 * 365)
     d["k"] = np.log(d["strike"] / d["underlying_price"])
     print(f"       t range: {d['t'].min():.4f} .. {d['t'].max():.4f} yr   "
           f"(expired rows t<=0: {(d['t'] <= 0).sum()})")

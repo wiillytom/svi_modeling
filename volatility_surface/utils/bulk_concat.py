@@ -180,10 +180,67 @@ def _clean_one(args: tuple[str, bool]) -> pd.DataFrame | None:
     path, filter_rows = args
     try:
         df = clean_df(path, filter_rows=filter_rows)
+        if df.empty:
+            # Distinct from an exception: the file parsed fine but every row was
+            # filtered out. Previously both returned None silently-ish, so a
+            # systematic filter wipe-out looked identical to "no errors" in the
+            # log while the skipped counter climbed. Say which it was.
+            print(f"  [empty] {path}: parsed but 0 rows survived cleaning")
         return df if not df.empty else None
     except Exception as e:
         print(f"  [skip] {path}: {e!r}")
         return None
+
+
+def diagnose_file(path: str) -> None:
+    """Row-count funnel through `clean_df`'s filter stages for ONE file.
+
+    Use when a run reports many skipped/empty files: it shows which filter is
+    removing the rows, rather than leaving you to guess between a schema change,
+    dead quotes, and a units change."""
+    import numpy as np
+    from volatility_surface.utils.data_handling import _normalise_schema_pd
+    from volatility_surface.core.pricing.volatility_dataframe import implied_volatility_dataframe
+
+    raw = pd.read_csv(path)
+    print(f"\n=== {os.path.basename(path)} ===")
+    print(f"  columns ({len(raw.columns)}): {list(raw.columns)}")
+    print(f"  1. raw rows                     : {len(raw)}")
+    df = _normalise_schema_pd(raw)
+    print(f"  2. after schema normalise       : {len(df)}   (non-option names dropped)")
+
+    for c in ("volume", "bid_price", "ask_price", "underlying_price", "mark_iv"):
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce")
+            print(f"       {c:18s} NaN {s.isna().mean():5.1%} | <=0 {(s <= 0).mean():5.1%} | "
+                  f"median {s.median()!r}")
+
+    d = df[pd.to_numeric(df["volume"], errors="coerce") > 0]
+    print(f"  3. after volume > 0             : {len(d)}")
+    put_m = (d["underlying_price"] * d["bid_price"] < d["strike"]) & (d["option_type"] == "P")
+    call_m = (d["option_type"] == "C") & (d["bid_price"] < 1)
+    d = d[put_m | call_m]
+    print(f"  4. after no-arb boundary        : {len(d)}")
+    if d.empty:
+        print("     -> everything died here; inspect bid_price/underlying_price above")
+        return
+
+    d = d.copy()
+    exp = pd.to_datetime(d["expiration_timestamp"], format="%d%b%y") + pd.Timedelta(hours=8)
+    d["t"] = (exp.astype("int64") / 1e6 - float(df["creation_timestamp_x"].iloc[0])) / (3.6e6 * 24 * 365)
+    d["k"] = np.log(d["strike"] / d["underlying_price"])
+    print(f"       t range: {d['t'].min():.4f} .. {d['t'].max():.4f} yr   "
+          f"(expired rows t<=0: {(d['t'] <= 0).sum()})")
+    d = d[((d.option_type == "C") & (d.k >= 0)) | ((d.option_type == "P") & (d.k <= 0))]
+    print(f"  5. after OTM filter             : {len(d)}")
+    if d.empty:
+        return
+    iv = d.apply(implied_volatility_dataframe, axis=1, result_type="expand")
+    d[["bid_iv", "ask_iv"]] = iv
+    n = d.dropna(subset=["bid_iv", "ask_iv"]).shape[0]
+    print(f"  6. after bid_iv/ask_iv dropna   : {n}   <- final row count")
+    if n == 0:
+        print("     -> IV solver returned NaN for every row (check bid/ask units and t)")
 
 
 def bulk_concat(root: str | list[str], out_path: str, filter_rows: bool = True,
@@ -304,9 +361,9 @@ def bulk_concat(root: str | list[str], out_path: str, filter_rows: bool = True,
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", required=True, nargs="+",
+    ap.add_argument("--root", nargs="+",
                     help="one or more directories to scan recursively for CSVs")
-    ap.add_argument("--out", required=True, help="output parquet path")
+    ap.add_argument("--out", help="output parquet path")
     ap.add_argument("--glob", default="*.csv",
                     help="filename pattern, e.g. 'eth_*.csv' to take one coin only")
     ap.add_argument("--interval-minutes", type=int, default=60,
@@ -316,9 +373,18 @@ if __name__ == "__main__":
     ap.add_argument("--batch-size", type=int, default=500)
     ap.add_argument("--dry-run", action="store_true",
                     help="report how many files would be processed, then exit")
+    ap.add_argument("--diagnose", nargs="+", default=None,
+                    help="run the clean_df row-count funnel on these CSV files and exit "
+                         "— use to find which filter is emptying a batch of files")
     ap.add_argument("--no-filter", action="store_true",
                     help="keep every row (skip volume/no-arb/OTM filters) — for EDA")
     args = ap.parse_args()
+    if args.diagnose:
+        for f in args.diagnose:
+            diagnose_file(f)
+        raise SystemExit(0)
+    if not args.root or not args.out:
+        ap.error("--root and --out are required unless --diagnose is used")
     bulk_concat(args.root, args.out, filter_rows=not args.no_filter,
                 workers=args.workers, batch_size=args.batch_size, pattern=args.glob,
                 interval_minutes=args.interval_minutes or None, dry_run=args.dry_run)

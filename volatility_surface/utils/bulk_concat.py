@@ -303,7 +303,9 @@ def bulk_concat(root: str | list[str], out_path: str, filter_rows: bool = True,
     writer: pq.ParquetWriter | None = None
     schema: pa.Schema | None = None
     col_order: list[str] | None = None   # pinned from the first batch, see below
+    col_dtypes: dict = {}
     dropped_cols: set[str] = set()
+    recast_failed: set[str] = set()
     n_rows = 0
     n_skipped = 0
     t0 = time.time()
@@ -330,6 +332,7 @@ def bulk_concat(root: str | list[str], out_path: str, filter_rows: bool = True,
             # field names are not matching".
             if col_order is None:
                 col_order = list(batch_df.columns)
+                col_dtypes = batch_df.dtypes.to_dict()
             else:
                 missing = [c for c in col_order if c not in batch_df.columns]
                 extra = [c for c in batch_df.columns if c not in col_order]
@@ -345,6 +348,20 @@ def bulk_concat(root: str | list[str], out_path: str, filter_rows: bool = True,
                                   f"batch's schema — dropped for the whole file")
                             dropped_cols.add(c)
                 batch_df = batch_df[col_order]
+                # Align dtypes too, not just names/order: the same column can be
+                # int in one export vintage and str in another (seen on
+                # `instrument_id`), and pyarrow refuses that outright — mid-run,
+                # after tens of minutes of work. Coerce per column, and leave a
+                # column alone if it genuinely can't be cast rather than dying.
+                for c, want in col_dtypes.items():
+                    if batch_df[c].dtype != want:
+                        try:
+                            batch_df[c] = batch_df[c].astype(want)
+                        except (ValueError, TypeError):
+                            if c not in recast_failed:
+                                print(f"[bulk_concat] column {c!r}: cannot cast "
+                                      f"{batch_df[c].dtype} -> {want}, leaving as-is")
+                                recast_failed.add(c)
 
             table = pa.Table.from_pandas(batch_df, preserve_index=False)
             if writer is None:

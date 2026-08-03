@@ -75,10 +75,19 @@ def _normalise_schema_pd(df):
         df["expiration_timestamp"] = parsed[0]           # '27DEC24', the %d%b%y clean_df parses
         df["strike"] = parsed[1].astype(float)
         df["option_type"] = parsed[2]
-    if "instrument_id" not in df.columns and "instrument_name" in df.columns:
-        # instrument_name is itself a stable unique key — roll_engine only needs
-        # it to track a held position across snapshots.
-        df["instrument_id"] = df["instrument_name"]
+    # instrument_id must be ONE type and ONE convention across the whole history:
+    # the raw-ticker vintage has no such column (so it was derived from
+    # instrument_name -> str) while the merged vintage carries Deribit's numeric
+    # id (int). Mixing them broke the parquet write outright, and would have been
+    # worse if it hadn't: the same contract would carry two different ids either
+    # side of the schema change, so `roll_engine` — which tracks a held position
+    # by instrument_id — would lose it at the boundary. instrument_name is the
+    # stable, human-readable key present in both, so prefer it and always store
+    # a string.
+    if "instrument_name" in df.columns:
+        df["instrument_id"] = df["instrument_name"].astype(str)
+    elif "instrument_id" in df.columns:
+        df["instrument_id"] = df["instrument_id"].astype(str)
 
     # option_type convention differs by vintage: raw ticker CSVs (and the value
     # derived from instrument_name above) use 'C'/'P', exports merged with the
@@ -131,8 +140,11 @@ def _normalise_schema_pl(df: 'pl.DataFrame') -> 'pl.DataFrame':
                     pl.col("_p").struct.field("2").cast(pl.Float64).alias("strike"),
                     pl.col("_p").struct.field("3").alias("option_type"))
                 .drop("_p"))
-    if "instrument_id" not in df.columns and "instrument_name" in df.columns:
-        df = df.with_columns(pl.col("instrument_name").alias("instrument_id"))
+    # See the pandas counterpart: one id convention/type across all vintages.
+    if "instrument_name" in df.columns:
+        df = df.with_columns(pl.col("instrument_name").cast(pl.Utf8).alias("instrument_id"))
+    elif "instrument_id" in df.columns:
+        df = df.with_columns(pl.col("instrument_id").cast(pl.Utf8).alias("instrument_id"))
 
     # See the pandas counterpart: 'call'/'put' vs 'C'/'P' by export vintage.
     df = df.with_columns(

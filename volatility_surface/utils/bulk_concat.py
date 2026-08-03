@@ -208,6 +208,17 @@ def diagnose_file(path: str) -> None:
     print(f"  1. raw rows                     : {len(raw)}")
     df = _normalise_schema_pd(raw)
     print(f"  2. after schema normalise       : {len(df)}   (non-option names dropped)")
+    if "instrument_name" in raw.columns:
+        kept = set(df["instrument_name"]) if "instrument_name" in df.columns else set()
+        dropped = [n for n in raw["instrument_name"].astype(str).unique() if n not in kept]
+        if dropped:
+            print(f"     {len(dropped)} distinct names REJECTED by the option-name pattern, e.g.:")
+            for n in dropped[:8]:
+                print(f"       {n}")
+            if len(df) == 0:
+                print("     -> every row was rejected here: the instrument naming does not "
+                      "match CURRENCY-DDMMMYY-STRIKE-C/P (see _INSTRUMENT_RE)")
+                return
 
     for c in ("volume", "bid_price", "ask_price", "underlying_price", "mark_iv"):
         if c in df.columns:

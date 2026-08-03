@@ -80,12 +80,26 @@ def _normalise_schema_pd(df):
         # it to track a held position across snapshots.
         df["instrument_id"] = df["instrument_name"]
 
-    # option_type convention differs by vintage: the raw ticker CSVs (and the
-    # value derived from instrument_name above) use 'C'/'P', while the exports
-    # merged with the instruments endpoint carry Deribit's own 'call'/'put'.
-    # Every downstream filter compares against 'C'/'P' exactly, so a 'call'/'put'
-    # file silently filtered to zero rows — normalise once, here.
+    # option_type convention differs by vintage: raw ticker CSVs (and the value
+    # derived from instrument_name above) use 'C'/'P', exports merged with the
+    # instruments endpoint carry Deribit's 'call'/'put', and a merge that failed
+    # to match leaves NaN. Every downstream filter compares against 'C'/'P'
+    # exactly, so anything else silently filters the file to zero rows.
     df["option_type"] = df["option_type"].astype(str).str[0].str.upper()
+    bad = ~df["option_type"].isin(["C", "P"])
+    if bad.any():
+        # instrument_name is authoritative when present — prefer it over a
+        # column the upstream merge may have left null or malformed.
+        if "instrument_name" in df.columns:
+            recovered = df.loc[bad, "instrument_name"].astype(str).str.extract(_INSTRUMENT_RE)[2]
+            df.loc[bad, "option_type"] = recovered
+            bad = ~df["option_type"].isin(["C", "P"])
+        if bad.all():
+            raise ValueError(
+                f"option_type is never 'C'/'P' after normalisation (sample raw values: "
+                f"{df['option_type'].unique()[:6].tolist()}) — every row would be filtered out")
+        if bad.any():
+            df = df.loc[~bad].copy()
 
     missing = [c for c in _REQUIRED if c not in df.columns]
     if missing:

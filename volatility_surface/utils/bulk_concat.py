@@ -228,12 +228,17 @@ def diagnose_file(path: str) -> None:
 
     d = df[pd.to_numeric(df["volume"], errors="coerce") > 0]
     print(f"  3. after volume > 0             : {len(d)}")
+    print(f"       option_type values: {d['option_type'].value_counts().to_dict()}")
+    print(f"       strike dtype {d['strike'].dtype}, sample {d['strike'].head(3).tolist()}")
     put_m = (d["underlying_price"] * d["bid_price"] < d["strike"]) & (d["option_type"] == "P")
     call_m = (d["option_type"] == "C") & (d["bid_price"] < 1)
+    print(f"       put mask True: {int(put_m.sum())} | call mask True: {int(call_m.sum())}")
     d = d[put_m | call_m]
     print(f"  4. after no-arb boundary        : {len(d)}")
     if d.empty:
-        print("     -> everything died here; inspect bid_price/underlying_price above")
+        print("     -> everything died here. If option_type above is not C/P the merge "
+              "left it null/worded; if it IS C/P, check bid_price units (should be COIN, "
+              "~0.0-0.5, not USD).")
         return
 
     d = d.copy()

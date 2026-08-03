@@ -48,6 +48,11 @@ def main() -> None:
                         "overrides --funding-annual-rate")
     p.add_argument("--option-fee-bps", type=float, default=0.0,
                    help="explicit option fee on top of the bid/ask spread (default 0)")
+    p.add_argument("--start", default=None, help="window start, YYYY-MM-DD (UTC)")
+    p.add_argument("--end", default=None, help="window end, YYYY-MM-DD (UTC, exclusive)")
+    p.add_argument("--regime", default=None,
+                   help="named regime from roll_engine.REGIMES (bear1/bear2/bear3/bull1/bull2), "
+                        "or 'all' to run every regime and print one row per strategy x regime")
     p.add_argument("--accounting", default="coin", choices=["coin", "usd"],
                    help="coin = funded in ETH/BTC, P&L accrues in coin (paper Tables 1/3-5); "
                         "usd = funded in USD, coin P&L swapped to USD as it accrues (Table 2)")
@@ -66,6 +71,28 @@ def main() -> None:
         print("\n".join(R.catalog_names()))
         return
 
+    if args.all and args.regime == "all":
+        # One column block per regime: the point is to see whether a strategy's
+        # edge survives a regime it was not selected on.
+        tables = {}
+        for name in R.REGIMES:
+            print(f"\n--- regime {name} {R.REGIMES[name]} ---")
+            res = R.run_all_strategies(
+                args.options, args.perp, frequencies=(args.frequency.split(",")[0],),
+                initial_coin=args.initial_coin, size_multiple=args.size_multiple,
+                funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
+                option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
+                accounting=args.accounting, initial_usd=args.initial_usd,
+                regime=name, max_snaps=args.max_snaps, verbose=not args.quiet)
+            tables[name] = RR.results_table(res, benchmark_name=args.coin)
+        combined = RR.regime_table(tables)
+        print()
+        print(combined.to_string())
+        if args.csv:
+            combined.to_csv(args.csv)
+            print(f"\nsaved table -> {args.csv}")
+        return
+
     if args.all:
         freqs = tuple(f.strip() for f in args.frequency.split(","))
         results = R.run_all_strategies(
@@ -74,6 +101,7 @@ def main() -> None:
             funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
             option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
             accounting=args.accounting, initial_usd=args.initial_usd,
+            start=args.start, end=args.end, regime=args.regime,
             max_snaps=args.max_snaps, verbose=not args.quiet)
         table = RR.results_table(results, benchmark_name=args.coin)
         print()
@@ -89,6 +117,7 @@ def main() -> None:
         funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
         option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
         accounting=args.accounting, initial_usd=args.initial_usd,
+        start=args.start, end=args.end, regime=args.regime,
         max_snaps=args.max_snaps, verbose=not args.quiet)
     print()
     RR.print_summary(RR.summarize_rolls(res))

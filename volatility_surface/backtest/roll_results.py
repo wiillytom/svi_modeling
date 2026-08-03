@@ -130,6 +130,34 @@ def results_table(results: dict[str, dict], benchmark_name: str = "ETH") -> pd.D
     return pd.DataFrame(rows, index=index)[_COLS]
 
 
+def regime_table(tables: dict[str, pd.DataFrame],
+                 metrics: tuple[str, ...] = ("Total", "Sharpe")) -> pd.DataFrame:
+    """Stack per-regime `results_table`s side by side: one row per strategy, one
+    column block per regime.
+
+    This is the table that answers whether an edge is real or regime-specific.
+    A long-vol structure that tops the full-sample ranking while every bear
+    regime is doing the work is not an edge, it is a directional bet on
+    volatility rising — the `bull` columns are where that shows up.
+
+    A `spread` column reports (worst regime - best regime) on the first metric:
+    the more negative, the more the result depends on which regime you landed in.
+    """
+    out = {}
+    for regime, tbl in tables.items():
+        for m in metrics:
+            out[(regime, m)] = tbl[m]
+    df = pd.DataFrame(out)
+    df.columns = pd.MultiIndex.from_tuples(df.columns, names=["regime", "metric"])
+
+    first = metrics[0]
+    sub = df.xs(first, axis=1, level="metric")
+    df[("consistency", f"min {first}")] = sub.min(axis=1)
+    df[("consistency", f"max {first}")] = sub.max(axis=1)
+    df[("consistency", "n regimes > 0")] = (sub > 0).sum(axis=1)
+    return df.round(3)
+
+
 def format_table(df: pd.DataFrame) -> str:
     """Percent-format the return/vol/dd columns; keep Sharpe/Skew/beta/R2 raw."""
     out = df.copy()

@@ -185,6 +185,52 @@ def _daily_0800_grid(start_ms: int, end_ms: int) -> list[int]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Market regimes
+# --------------------------------------------------------------------------- #
+#: Hand-labelled ETH regimes over the 2024-2026 dataset, as (start, end) UTC
+#: dates. Deliberately NOT derived from the data: the paper's own regime split
+#: (Fig 8/9) sorts monthly returns and cuts the tails at 16%, which is circular
+#: when the question is "does this strategy survive a regime it did not fit to".
+#: These are the user's own reading of the market and are meant to be edited.
+#: Note the gaps (e.g. 2024-09-07 -> 2024-11-02) — those months belong to
+#: neither camp and are simply excluded from a regime run.
+REGIMES: dict[str, tuple[str, str]] = {
+    "bear1": ("2024-06-05", "2024-09-07"),
+    "bear2": ("2024-12-07", "2025-04-12"),
+    "bear3": ("2025-09-13", "2026-08-03"),
+    "bull1": ("2024-11-02", "2024-12-07"),
+    "bull2": ("2025-04-12", "2025-09-13"),
+}
+
+
+def _to_ms(when, default=None) -> int | None:
+    """Accept 'YYYY-MM-DD', a date/datetime, or epoch ms. Naive dates are UTC."""
+    if when is None:
+        return default
+    if isinstance(when, (int, float)):
+        return int(when)
+    if isinstance(when, str):
+        when = dt.datetime.strptime(when, "%Y-%m-%d")
+    if isinstance(when, dt.date) and not isinstance(when, dt.datetime):
+        when = dt.datetime(when.year, when.month, when.day)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return int(when.timestamp() * 1000)
+
+
+def resolve_window(start=None, end=None, regime: str | None = None) -> tuple[int | None, int | None]:
+    """(start_ms, end_ms) from either an explicit window or a named regime.
+    An explicit start/end overrides the corresponding regime bound."""
+    if regime is not None:
+        if regime not in REGIMES:
+            raise ValueError(f"unknown regime {regime!r} — one of {list(REGIMES)}")
+        r_start, r_end = REGIMES[regime]
+        start = start if start is not None else r_start
+        end = end if end is not None else r_end
+    return _to_ms(start), _to_ms(end)
+
+
 def roll_grid(start_ms: int, end_ms: int, frequency: str) -> list[int]:
     if frequency == "daily":
         return _daily_0800_grid(start_ms, end_ms)
@@ -211,19 +257,29 @@ def _perp_at(perp_ts: np.ndarray, perp_close: np.ndarray, ts_ms: int) -> float:
     return float(perp_close[idx])
 
 
-def _iter_snapshots(option_path: str, max_snaps: int | None = None):
+def _iter_snapshots(option_path: str, max_snaps: int | None = None,
+                    start_ms: int | None = None, end_ms: int | None = None):
     """Yield (ts_ms, snapshot_df) chronologically from a single parquet or a
     directory of chunk_*.parquet. Snapshot key is `creation_timestamp_x` (see
-    `engine._iter_snapshots` for why `file_timestamp` is the wrong key)."""
+    `engine._iter_snapshots` for why `file_timestamp` is the wrong key).
+
+    `start_ms`/`end_ms` restrict the window (end is exclusive). Filtering happens
+    in polars before materialising to pandas, so a regime run over one month of a
+    three-year file does not pay to convert the other 35."""
     if os.path.isdir(option_path):
         paths = sorted(glob.glob(os.path.join(option_path, "chunk_*.parquet")))
     else:
         paths = [option_path]
     n = 0
     for path in paths:
-        day = pl.read_parquet(path).to_pandas()
-        if day.empty:
+        lf = pl.read_parquet(path)
+        if start_ms is not None:
+            lf = lf.filter(pl.col("creation_timestamp_x") >= start_ms)
+        if end_ms is not None:
+            lf = lf.filter(pl.col("creation_timestamp_x") < end_ms)
+        if lf.is_empty():
             continue
+        day = lf.to_pandas()
         for ts, snap in day.groupby("creation_timestamp_x", sort=True):
             snap = snap.drop_duplicates(subset="instrument_id", keep="first").reset_index(drop=True)
             yield int(ts), snap
@@ -556,6 +612,7 @@ def _finalize(state: dict, cfg) -> dict:
             "params": {"structure": state["name"], "frequency": state["frequency"],
                        "initial_coin": cfg.initial_coin, "size_multiple": cfg.size_multiple,
                        "accounting": cfg.accounting, "initial_nav": cfg.initial_nav,
+                       "regime": cfg.regime, "window": cfg.window,
                        "nav_unit": "USD" if cfg.usd else "coin",
                        "funding_annual_rate": cfg.funding_rate,
                        "option_fee_bps": cfg.opt_fee_frac * 10_000.0,
@@ -584,6 +641,7 @@ def run_all_strategies(option_path: str, perp_path: str,
                        funding_annual_rate: float = 0.0, funding_series=None,
                        option_fee_bps: float = 0.0, hedge_band: float = 0.05,
                        accounting: str = "coin", initial_usd: float | None = None,
+                       start=None, end=None, regime: str | None = None,
                        max_snaps: int | None = None, verbose: bool = True) -> dict[str, dict]:
     """Backtest an entire catalog x frequencies in ONE pass over the option
     data. Returns {strategy_name: result_dict}; hand the whole dict to
@@ -611,11 +669,27 @@ def run_all_strategies(option_path: str, perp_path: str,
                                 perp_cost_frac=PERP_COST_BPS / 10_000.0,
                                 funding_rate=funding_annual_rate,
                                 funding_fn=_resolve_funding(funding_series),
-                                hedge_band=hedge_band)
+                                hedge_band=hedge_band, regime=regime, window=None)
+
+    start_ms, end_ms = resolve_window(start, end, regime)
+    cfg.window = (
+        dt.datetime.fromtimestamp(start_ms / 1000, dt.timezone.utc).strftime("%Y-%m-%d") if start_ms else None,
+        dt.datetime.fromtimestamp(end_ms / 1000, dt.timezone.utc).strftime("%Y-%m-%d") if end_ms else None,
+    )
 
     perp_ts, perp_close = _perp_series(perp_path)
-    first_ts = next(_iter_snapshots(option_path, max_snaps=1))[0]
-    end_ts = int(perp_ts[-1])
+    try:
+        first_ts = next(_iter_snapshots(option_path, max_snaps=1,
+                                        start_ms=start_ms, end_ms=end_ms))[0]
+    except StopIteration:
+        raise ValueError(
+            f"no option snapshots in the requested window "
+            f"({start_ms and dt.datetime.fromtimestamp(start_ms/1000, dt.timezone.utc)} -> "
+            f"{end_ms and dt.datetime.fromtimestamp(end_ms/1000, dt.timezone.utc)})")
+    # The roll grid must live inside the window, not span the whole file: a
+    # regime run should open its first position at the first roll date ON OR
+    # AFTER the window opens, and stop at the window's end.
+    end_ts = min(int(perp_ts[-1]), end_ms) if end_ms is not None else int(perp_ts[-1])
 
     # The account's starting value, in whichever currency funds it. Under USD
     # accounting the paper sets D_0^USD = S_0 (the price of one coin at
@@ -635,9 +709,21 @@ def run_all_strategies(option_path: str, perp_path: str,
             label = f"{name} [{freq}]" if multi_freq else name
             states.append(_init_state(label, legs, freq, grid))
 
+    if verbose:
+        w0 = dt.datetime.fromtimestamp(first_ts / 1000, dt.timezone.utc)
+        w1 = dt.datetime.fromtimestamp(end_ts / 1000, dt.timezone.utc)
+        label = f" [{regime}]" if regime else ""
+        n_rolls = len(states[0]["grid"]) if states else 0
+        print(f"[window]{label} {w0:%Y-%m-%d} -> {w1:%Y-%m-%d} "
+              f"({(w1 - w0).days} days, {n_rolls} {frequencies[0]} roll dates)")
+        if n_rolls < 4:
+            print("[window] WARNING: fewer than 4 rolls in this window — annualised "
+                  "figures (P.a., Sharpe) are extrapolated from very few observations")
+
     last_hour = None
     n = 0
-    for ts_ms, snap in _iter_snapshots(option_path, max_snaps=max_snaps):
+    for ts_ms, snap in _iter_snapshots(option_path, max_snaps=max_snaps,
+                                       start_ms=start_ms, end_ms=end_ms):
         n += 1
         hour = ts_ms // MS_PER_HOUR
         need_hedge = last_hour is None or hour != last_hour
@@ -673,6 +759,7 @@ def run_roll_backtest(option_path: str, perp_path: str,
                       funding_annual_rate: float = 0.0, funding_series=None,
                       option_fee_bps: float = 0.0, hedge_band: float = 0.05,
                       accounting: str = "coin", initial_usd: float | None = None,
+                      start=None, end=None, regime: str | None = None,
                       max_snaps: int | None = None, verbose: bool = True) -> dict:
     """Single-strategy wrapper on `run_all_strategies`. `structure` is a catalog
     name ("Short Straddle", "Long 25D Strangle", ...) or an old lowercase alias
@@ -686,5 +773,6 @@ def run_roll_backtest(option_path: str, perp_path: str,
                              size_multiple=size_multiple, funding_annual_rate=funding_annual_rate,
                              funding_series=funding_series, option_fee_bps=option_fee_bps,
                              hedge_band=hedge_band, accounting=accounting,
-                             initial_usd=initial_usd, max_snaps=max_snaps, verbose=verbose)
+                             initial_usd=initial_usd, start=start, end=end, regime=regime,
+                             max_snaps=max_snaps, verbose=verbose)
     return res[name]

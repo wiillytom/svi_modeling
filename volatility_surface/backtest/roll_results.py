@@ -130,6 +130,58 @@ def results_table(results: dict[str, dict], benchmark_name: str = "ETH") -> pd.D
     return pd.DataFrame(rows, index=index)[_COLS]
 
 
+def sharpe_by_regime(result: dict, regimes: dict[str, tuple[str, str]]) -> pd.DataFrame:
+    """Decompose ONE full-period run's Sharpe into per-regime contributions —
+    the paper's Fig 8/9 construction (§5.3.2): for each regime, the mean daily
+    return inside it, times the regime's frequency, divided by the TOTAL
+    volatility. Built that way the contributions ADD UP to the overall Sharpe,
+    which averaging per-regime Sharpes does not.
+
+    Requires a run over the whole period (no window), so that "frequency" and
+    "total volatility" are well defined. Regimes that leave gaps in the calendar
+    are fine: the uncovered days land in an "unclassified" row, so the column
+    still sums to the total.
+    """
+    nav = result["nav"]
+    daily = _daily_last(nav, "coin_nav")
+    if len(daily) < 3:
+        return pd.DataFrame()
+    r = np.log(daily / daily.shift(1)).dropna()
+    total_vol = r.std(ddof=1) * np.sqrt(365.0)
+    n_days = len(r)
+
+    rows, claimed = [], pd.Series(False, index=r.index)
+    for name, (a, b) in regimes.items():
+        m = (r.index >= pd.Timestamp(a, tz="UTC")) & (r.index < pd.Timestamp(b, tz="UTC"))
+        claimed |= m
+        if not m.any():
+            continue
+        seg = r[m]
+        freq = len(seg) / n_days
+        rows.append({"regime": name, "days": len(seg), "frequency": freq,
+                     "mean_ret_ann": float(seg.mean() * 365.0),
+                     "sharpe_in_regime": float(seg.mean() * 365.0 / (seg.std(ddof=1) * np.sqrt(365.0)))
+                     if seg.std(ddof=1) > 0 else np.nan,
+                     "sharpe_contribution": float(seg.mean() * 365.0 * freq / total_vol)
+                     if total_vol > 0 else np.nan})
+    rest = r[~claimed]
+    if len(rest):
+        freq = len(rest) / n_days
+        rows.append({"regime": "unclassified", "days": len(rest), "frequency": freq,
+                     "mean_ret_ann": float(rest.mean() * 365.0),
+                     "sharpe_in_regime": float(rest.mean() * 365.0 / (rest.std(ddof=1) * np.sqrt(365.0)))
+                     if rest.std(ddof=1) > 0 else np.nan,
+                     "sharpe_contribution": float(rest.mean() * 365.0 * freq / total_vol)
+                     if total_vol > 0 else np.nan})
+
+    df = pd.DataFrame(rows).set_index("regime")
+    df.loc["TOTAL"] = {"days": n_days, "frequency": 1.0,
+                       "mean_ret_ann": float(r.mean() * 365.0),
+                       "sharpe_in_regime": float(r.mean() * 365.0 / total_vol) if total_vol > 0 else np.nan,
+                       "sharpe_contribution": float(df["sharpe_contribution"].sum())}
+    return df.round(3)
+
+
 def regime_table(tables: dict[str, pd.DataFrame],
                  metrics: tuple[str, ...] = ("Total", "Sharpe")) -> pd.DataFrame:
     """Stack per-regime `results_table`s side by side: one row per strategy, one

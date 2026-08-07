@@ -310,6 +310,53 @@ def compare_to_regimes(df: pd.DataFrame, regimes: dict) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("regime").round(3)
 
 
+def premium_by_state(option_path: str, perp_path: str, n_states: int = 2,
+                     frequency: str = "weekly", rv_freq: str = "1h",
+                     walk_forward: bool = False, min_train: int = 40) -> pd.DataFrame:
+    """The tradeable premium, conditioned on the discovered state.
+
+    Deliberately joins the state to `IV - RV_FUTURE`, not to the `iv_minus_rv`
+    feature the model was fitted on: that feature uses PAST realised vol and is
+    one of the fitting inputs, so it separates the states by construction and
+    says nothing about whether anything can be harvested. Forward realised vol
+    is not a feature and is not observable at the roll — which is exactly why it
+    is the honest target.
+
+    A premium that is zero in every state means there is nothing to alternate
+    between, whatever the state model says.
+    """
+    from volatility_surface.backtest import vrp_signal as V
+
+    feats = build_features(option_path, perp_path, frequency, rv_freq)
+    if feats.empty:
+        return feats
+    labelled = discover(feats, n_states=n_states, walk_forward=walk_forward,
+                        min_train=min_train)
+
+    panel = V.build_panel(option_path, perp_path, frequency, rv_freq=rv_freq)
+    merged = labelled[["date", "state"]].merge(
+        panel[["date", "iv", "rv_fut", "premium"]], on="date", how="inner")
+    merged = merged[merged["state"] >= 0]
+    if merged.empty:
+        return merged
+
+    rows = []
+    for k, g in merged.groupby("state"):
+        p = g["premium"].to_numpy()
+        se = p.std(ddof=1) / np.sqrt(len(p)) if len(p) > 1 else np.nan
+        rows.append({"state": int(k), "n": len(p),
+                     "mean_iv": g["iv"].mean(), "mean_rv_fut": g["rv_fut"].mean(),
+                     "premium": p.mean(), "t_stat": p.mean() / se if se else np.nan})
+    allp = merged["premium"].to_numpy()
+    se = allp.std(ddof=1) / np.sqrt(len(allp))
+    rows.append({"state": -1, "n": len(allp), "mean_iv": merged["iv"].mean(),
+                 "mean_rv_fut": merged["rv_fut"].mean(), "premium": allp.mean(),
+                 "t_stat": allp.mean() / se if se else np.nan})
+    out = pd.DataFrame(rows).set_index("state").round(4)
+    out.index = [("ALL" if i == -1 else f"state{i}") for i in out.index]
+    return out
+
+
 if __name__ == "__main__":
     import argparse
     from volatility_surface.backtest import roll_engine as R

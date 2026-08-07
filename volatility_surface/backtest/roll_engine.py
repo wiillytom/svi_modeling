@@ -682,10 +682,25 @@ def run_all_strategies(option_path: str, perp_path: str,
         first_ts = next(_iter_snapshots(option_path, max_snaps=1,
                                         start_ms=start_ms, end_ms=end_ms))[0]
     except StopIteration:
+        # Report what the file DOES cover: an empty window is nearly always a
+        # source-data gap rather than a bad window, and the difference is not
+        # something the caller can see from the request alone.
+        def _fmt(ms):
+            return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).strftime("%Y-%m-%d") if ms else "-"
+        try:
+            probe = (pl.scan_parquet(os.path.join(option_path, "chunk_*.parquet")
+                                     if os.path.isdir(option_path) else option_path)
+                       .select(pl.col("creation_timestamp_x").min().alias("lo"),
+                               pl.col("creation_timestamp_x").max().alias("hi"))
+                       .collect())
+            have = f"{_fmt(probe['lo'][0])} .. {_fmt(probe['hi'][0])}"
+        except Exception:
+            have = "unknown"
         raise ValueError(
-            f"no option snapshots in the requested window "
-            f"({start_ms and dt.datetime.fromtimestamp(start_ms/1000, dt.timezone.utc)} -> "
-            f"{end_ms and dt.datetime.fromtimestamp(end_ms/1000, dt.timezone.utc)})")
+            f"no option snapshots between {_fmt(start_ms)} and {_fmt(end_ms)}"
+            f"{f' (regime {regime!r})' if regime else ''}. "
+            f"The file spans {have} — but coverage inside that span can still be "
+            f"patchy; run utils/validate_dataset.py to see snapshots per month.")
     # The roll grid must live inside the window, not span the whole file: a
     # regime run should open its first position at the first roll date ON OR
     # AFTER the window opens, and stop at the window's end.

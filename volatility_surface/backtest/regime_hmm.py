@@ -31,9 +31,23 @@ size a genuinely neutral structure, or to condition the premium measurement.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
+import pandas as pd
 
 _LOG2PI = float(np.log(2.0 * np.pi))
+
+#: Default feature set. All are observable AT the roll instant — no forward
+#: realised vol, no regime label, nothing that needs the future. `rv_past` is the
+#: vol over the week just ended, `iv_atm` what the market prices for the week
+#: ahead, their difference the instantaneous premium, `rr25` the skew.
+DEFAULT_FEATURES = ("log_rv_past", "iv_atm", "iv_minus_rv", "rr25")
 
 
 # --------------------------------------------------------------------------- #
@@ -196,3 +210,147 @@ def walk_forward_states(X: np.ndarray, n_states: int = 2, min_train: int = 40,
             model = GaussianHMM(n_states=n_states, seed=seed).fit(X[:t + 1])
         out[t] = model.filtered_states(X[:t + 1])[-1]
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Features, discovery, reporting
+# --------------------------------------------------------------------------- #
+def build_features(option_path: str, perp_path: str, frequency: str = "weekly",
+                   rv_freq: str = "1h") -> pd.DataFrame:
+    """Feature panel at each roll date, from the same machinery `vrp_signal`
+    uses — one source of truth for how IV and RV are extracted."""
+    from volatility_surface.backtest import roll_engine as R
+    from volatility_surface.backtest import vrp_signal as V
+
+    rets = V.perp_log_returns(perp_path, freq=rv_freq)
+    lo = int(rets.index[0].timestamp() * 1000)
+    hi = int(rets.index[-1].timestamp() * 1000)
+    grid = R.roll_grid(lo, hi, frequency)
+    df = V.iv_by_delta_series(option_path, grid)
+    if df.empty:
+        return df
+
+    horizon = pd.Timedelta(milliseconds=int(np.median(np.diff(grid))))
+    df["rv_past"] = [V.realised_vol(rets, d - horizon, d) for d in df["date"]]
+    df["log_rv_past"] = np.log(df["rv_past"])
+    df["iv_minus_rv"] = df["iv_atm"] - df["rv_past"]
+    return df.dropna(subset=list(DEFAULT_FEATURES)).reset_index(drop=True)
+
+
+def _standardise(X: np.ndarray) -> np.ndarray:
+    """Features live on wildly different scales (iv_atm ~0.65 vs rr25 ~-0.02);
+    without this the covariance — and therefore the state assignment — is
+    decided almost entirely by the largest-scale column."""
+    mu, sd = X.mean(axis=0), X.std(axis=0)
+    return (X - mu) / np.where(sd > 0, sd, 1.0)
+
+
+def discover(df: pd.DataFrame, n_states: int = 2,
+             features: tuple[str, ...] = DEFAULT_FEATURES,
+             walk_forward: bool = False, min_train: int = 40,
+             seed: int = 0) -> pd.DataFrame:
+    """Fit the HMM and label each roll date.
+
+    `walk_forward=False` (default) uses SMOOTHED states: the right tool for
+    "what periods are in this history", and the wrong one for any P&L claim.
+    `walk_forward=True` gives what was knowable at each date.
+    """
+    X = _standardise(df[list(features)].to_numpy(dtype=float))
+    out = df.copy()
+    if walk_forward:
+        probs = walk_forward_states(X, n_states=n_states, min_train=min_train, seed=seed)
+        out["state"] = np.where(np.isnan(probs[:, 0]), -1, np.nanargmax(probs, axis=1))
+    else:
+        model = GaussianHMM(n_states=n_states, seed=seed).fit(X)
+        probs = model.smoothed_states(X)
+        out["state"] = probs.argmax(axis=1)
+        out.attrs["model"] = model
+    for k in range(n_states):
+        out[f"p_state{k}"] = probs[:, k]
+    return out
+
+
+def segments(df: pd.DataFrame) -> pd.DataFrame:
+    """Contiguous runs of the same state — the 'periods it discovered'."""
+    rows, start, cur = [], 0, df["state"].iloc[0]
+    for i in range(1, len(df) + 1):
+        if i == len(df) or df["state"].iloc[i] != cur:
+            a, b = df["date"].iloc[start], df["date"].iloc[i - 1]
+            rows.append({"state": int(cur), "start": a.date(), "end": b.date(),
+                         "days": (b - a).days, "n_rolls": i - start})
+            if i < len(df):
+                start, cur = i, df["state"].iloc[i]
+    return pd.DataFrame(rows)
+
+
+def state_profile(df: pd.DataFrame, features: tuple[str, ...] = DEFAULT_FEATURES) -> pd.DataFrame:
+    """Mean of each feature per state — this is what makes a state interpretable
+    ('state 1 is the high-vol, negative-skew one') rather than a bare index."""
+    return df.groupby("state")[list(features)].mean().round(4).join(
+        df.groupby("state").size().rename("n_rolls"))
+
+
+def compare_to_regimes(df: pd.DataFrame, regimes: dict) -> pd.DataFrame:
+    """Share of each hand-drawn regime's rolls falling in each discovered state.
+
+    The question this answers: did the labels drawn by looking at the price path
+    correspond to anything a model could have identified without that hindsight?
+    """
+    rows = []
+    for name, (a, b) in regimes.items():
+        m = (df["date"] >= pd.Timestamp(a, tz="UTC")) & (df["date"] < pd.Timestamp(b, tz="UTC"))
+        seg = df[m]
+        if seg.empty:
+            continue
+        r = {"regime": name, "n_rolls": len(seg)}
+        for k in sorted(df["state"].unique()):
+            if k >= 0:
+                r[f"state{k}"] = float((seg["state"] == k).mean())
+        rows.append(r)
+    return pd.DataFrame(rows).set_index("regime").round(3)
+
+
+if __name__ == "__main__":
+    import argparse
+    from volatility_surface.backtest import roll_engine as R
+
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--options", required=True)
+    ap.add_argument("--perp", required=True)
+    ap.add_argument("--frequency", default="weekly")
+    ap.add_argument("--rv-frequency", default="1h")
+    ap.add_argument("--states", type=int, default=2)
+    ap.add_argument("--walk-forward", action="store_true",
+                    help="use only information available at each date (harder, honest)")
+    ap.add_argument("--min-train", type=int, default=40)
+    ap.add_argument("--csv", default=None)
+    a = ap.parse_args()
+
+    feats = build_features(a.options, a.perp, a.frequency, a.rv_frequency)
+    if feats.empty:
+        raise SystemExit("no usable rolls — check the option file covers the perp range")
+    print(f"\n{len(feats)} roll dates, {feats['date'].min():%Y-%m-%d} -> {feats['date'].max():%Y-%m-%d}")
+
+    df = discover(feats, n_states=a.states, walk_forward=a.walk_forward,
+                  min_train=a.min_train)
+    mode = "WALK-FORWARD (only past information)" if a.walk_forward else \
+           "SMOOTHED (whole sample — descriptive only, never backtest on this)"
+    print(f"\n{'=' * 72}\nSTATE PROFILE   [{mode}]\n{'=' * 72}")
+    print(state_profile(df).to_string())
+    m = df.attrs.get("model")
+    if m is not None:
+        print(f"\n  persistence (diag of transition matrix): {np.diag(m.transmat_).round(3)}")
+        print(f"  loglik {m.loglik_:.1f} | BIC {m.bic_:.1f} | {m.n_params_} params")
+
+    print(f"\n{'=' * 72}\nPERIODS DISCOVERED\n{'=' * 72}")
+    print(segments(df).to_string(index=False))
+
+    print(f"\n{'=' * 72}\nOVERLAP WITH THE HAND-DRAWN REGIMES\n{'=' * 72}")
+    print(compare_to_regimes(df, R.REGIMES).to_string())
+    print("\n  A regime that splits across states was not one thing; two regimes")
+    print("  landing in the same state were not two things.")
+
+    if a.csv:
+        df.to_csv(a.csv, index=False)
+        print(f"\nsaved -> {a.csv}")

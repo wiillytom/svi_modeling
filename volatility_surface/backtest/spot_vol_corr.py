@@ -17,6 +17,18 @@ A gap between the two is informative: implied more negative than realised means
 the market pays more for downside vol protection than the underlying's own
 behaviour warrants.
 
+`--levels` switches from the correlation view to the LEVEL view: every estimator's
+annualised vol through time, spot on the twin axis. Different question, same panel:
+
+    iv - rv_close             the premium an hourly hedger can actually earn.
+    rv_range - rv_close       the DISCRETISATION LOSS — variation inside the
+                              hedging interval, which close-to-close cannot see
+                              and a hedger rebalancing at `bar_freq` never
+                              monetises. On ETH 2024-2026 this runs +3.3 vol
+                              points (Parkinson) to +6.5 (Rogers-Satchell), and
+                              it is state-dependent: near zero at 50% vol,
+                              ~15 points at the peaks.
+
 The implied series is built at CONSTANT MATURITY. Taking "the front expiry's ATM
 vol" instead produces a sawtooth as maturity decays and then jumps at each roll,
 and the correlation would then partly measure that artefact rather than the
@@ -216,27 +228,22 @@ def rolling(df: pd.DataFrame, window_days: int = 90) -> pd.DataFrame:
     return pd.DataFrame(cols)
 
 
-def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
-         window_days: int = 90, regimes: dict | None = None,
-         spot: pd.Series | None = None, implied: bool = True) -> None:
-    """Rolling correlations on the left axis; optionally the spot on a twin
-    right axis for context.
+def _backdrop(ax, regimes: dict | None, spot: pd.Series | None,
+              log_spot: bool = False) -> list:
+    """Regime bands and the spot on a twin right axis — the context both the
+    correlation and the level view share. Returns the legend handles.
 
-    The spot is drawn in grey and behind the correlations on purpose: it is
-    there to read the correlations against, not as a third signal competing for
-    attention. Regime bands get explicit legend entries — without them the two
-    shades are indistinguishable at low alpha and the reader cannot tell a bull
-    band from a bear band, or either from an unclassified gap.
+    The spot is drawn in grey and behind the data on purpose: it is there to read
+    the curves against, not as another signal competing for attention. Regime
+    bands get explicit legend entries — without them the two shades are
+    indistinguishable at low alpha and the reader cannot tell a bull band from a
+    bear band, or either from an unclassified gap.
     """
-    import matplotlib
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
     from volatility_surface.plots.vol_plots import PALETTE
 
     BULL, BEAR = PALETTE[1], PALETTE[6]
-    fig, ax = plt.subplots(figsize=(13, 5.5))
-
     handles = []
     if regimes:
         for name, (a, b) in regimes.items():
@@ -250,12 +257,32 @@ def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
     if spot is not None:
         ax2 = ax.twinx()
         ax2.plot(spot.index, spot.values, color="0.45", lw=1.0, alpha=0.75, zorder=1)
+        if log_spot:
+            # ETH spans 1500-4800 over 2024-2026; on a linear axis the early
+            # years compress into a flat line
+            ax2.set_yscale("log")
         ax2.set_ylabel("spot (USD)", color="0.35")
         ax2.tick_params(axis="y", labelcolor="0.35")
         ax2.set_zorder(1)
         ax.set_zorder(2)
         ax.patch.set_visible(False)   # else the left axes' background hides the spot
         handles.append(plt.Line2D([], [], color="0.45", lw=1.0, label="spot (right axis)"))
+    return handles
+
+
+def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
+         window_days: int = 90, regimes: dict | None = None,
+         spot: pd.Series | None = None, implied: bool = True,
+         log_spot: bool = False) -> None:
+    """Rolling correlations on the left axis; optionally the spot on a twin
+    right axis for context."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from volatility_surface.plots.vol_plots import PALETTE
+
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    handles = _backdrop(ax, regimes, spot, log_spot)
 
     lines = []
     fi = full["corr"].to_dict()
@@ -293,6 +320,89 @@ def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
     print(f"saved -> {out_path}")
 
 
+# --------------------------------------------------------------------------- #
+# Levels — same panel, the other question
+# --------------------------------------------------------------------------- #
+def levels(df: pd.DataFrame) -> pd.DataFrame:
+    """Level statistics per series, IN VOL POINTS, plus the two gaps worth naming.
+
+    `vs_close` is the discretisation loss: how much more vol the estimator sees
+    than a hedger rebalancing at `bar_freq` can capture. `premium` is implied
+    minus that estimator's realised — what selling vol would have earned if the
+    strategy tracked THAT quantity. Only the `rv_close` row is harvestable at the
+    hedging frequency; the others price vol that is never monetised.
+
+    `n` is deliberately left unscaled — multiplying the whole frame by 100 to get
+    vol points turns the observation count into nonsense.
+    """
+    rows = []
+    for c in rv_columns(df) + (["iv"] if "iv" in df else []):
+        s = df[c].dropna()
+        rows.append({"series": c, "n": len(s), "mean": s.mean(),
+                     "median": s.median(), "min": s.min(), "max": s.max(),
+                     "std": s.std()})
+    out = pd.DataFrame(rows).set_index("series")
+    if "rv_close" in out.index:
+        out["vs_close"] = out["mean"] - out.loc["rv_close", "mean"]
+    if "iv" in out.index:
+        out["premium"] = out.loc["iv", "mean"] - out["mean"]
+        out.loc["iv", "premium"] = np.nan
+    scale = [c for c in out.columns if c != "n"]
+    out[scale] = out[scale] * 100
+    return out.round(2)
+
+
+def plot_levels(df: pd.DataFrame, out_path: str, regimes: dict | None = None,
+                spot: bool = True, log_spot: bool = False, implied: bool = True,
+                window_days: int | None = None, bar_freq: str | None = None,
+                target_days: float = 30.0) -> None:
+    """Annualised vol per estimator on the left axis, spot on the right.
+
+    Implied is drawn heaviest and in black because the quantity of interest is
+    its distance from `rv_close` — that gap is the harvestable premium and should
+    be the first thing the eye lands on. `rv_close` comes first among the
+    realised lines and stays solid: it is the reference the others are read
+    against, not one dashed line among four.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from volatility_surface.plots.vol_plots import PALETTE
+
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    handles = _backdrop(ax, regimes, df["spot"] if spot and "spot" in df else None,
+                        log_spot)
+
+    # dark end of the ramp only: the regime bands are drawn in the light end, and
+    # a light line over a light band is unreadable. The linestyle carries the
+    # distinction between estimators, the colour only has to stay visible.
+    cols = sorted(rv_columns(df), key=lambda c: c != "rv_close")
+    styles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
+    shades = [PALETTE[7], PALETTE[5], PALETTE[4], PALETTE[3], PALETTE[6]]
+    lines = []
+    for i, c in enumerate(cols):
+        l, = ax.plot(df.index, df[c] * 100, color=shades[i % len(shades)],
+                     ls=styles[i % len(styles)], lw=1.4, zorder=3,
+                     label=f"realised [{c[3:]}]   mean {df[c].mean():.1%}")
+        lines.append(l)
+
+    if implied and "iv" in df:
+        l, = ax.plot(df.index, df["iv"] * 100, color="black", lw=2.0, zorder=5,
+                     label=f"implied ATM {target_days:.0f}d   mean {df['iv'].mean():.1%}")
+        lines.insert(0, l)
+
+    ax.set_ylabel("annualised volatility (%)")
+    ax.set_title("Volatility levels"
+                 + (f" — {window_days}d trailing window" if window_days else "")
+                 + (f", {bar_freq} bars" if bar_freq else ""))
+    ax.legend(handles=lines + handles, loc="upper right", fontsize=7.5,
+              framealpha=0.92, ncol=2)
+    ax.grid(alpha=0.25, lw=0.5)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140)
+    print(f"saved -> {out_path}")
+
+
 def main() -> None:
     from volatility_surface.backtest import roll_engine as R
 
@@ -318,6 +428,10 @@ def main() -> None:
     ap.add_argument("--no-implied", action="store_true",
                     help="omit the implied (ΔIV) line; the y-axis then scales to "
                          "the realised correlations instead of staying on [-1, 1]")
+    ap.add_argument("--levels", action="store_true",
+                    help="plot vol LEVELS per estimator instead of correlations")
+    ap.add_argument("--log-spot", action="store_true",
+                    help="log scale on the spot axis")
     a = ap.parse_args()
 
     from volatility_surface.backtest.vrp_signal import ESTIMATORS
@@ -325,10 +439,27 @@ def main() -> None:
         e.strip() for e in a.estimators.split(","))
     df = build(a.options, a.perp, a.target_days, a.resample, a.rv_window,
                estimators=ests, bar_freq=a.bar_freq)
-    print(f"\n{len(df)} observations, {df.index[0]:%Y-%m-%d} -> {df.index[-1]:%Y-%m-%d}")
+    print(f"\n{len(df)} observations, {df.index[0]:%Y-%m-%d} -> {df.index[-1]:%Y-%m-%d}  "
+          f"[{a.rv_window}d trailing window on {a.bar_freq} bars]")
     print(f"ATM IV at constant {a.target_days:.0f}d: mean {df['iv'].mean():.1%}")
     for c in rv_columns(df):
         print(f"  {c:26s} mean {df[c].mean():.1%}")
+
+    if a.levels:
+        print(f"\n{'=' * 78}\nVOLATILITY LEVELS (vol points)\n{'=' * 78}")
+        print(levels(df).to_string())
+        print(f"\n  vs_close = discretisation loss: variation inside the hedging")
+        print(f"             interval, invisible to a hedger rebalancing every {a.bar_freq}.")
+        print("  premium  = implied minus that estimator's realised. Only the rv_close")
+        print("             row is harvestable by a hedger at this frequency.")
+        plot_levels(df, a.out, None if a.no_regimes else R.REGIMES,
+                    spot=not a.no_spot, log_spot=a.log_spot,
+                    implied=not a.no_implied, window_days=a.rv_window,
+                    bar_freq=a.bar_freq, target_days=a.target_days)
+        if a.csv:
+            df.to_csv(a.csv)
+            print(f"saved -> {a.csv}")
+        return
 
     full = full_window(df)
     print(f"\n{'=' * 62}\nFULL-WINDOW SPOT-VOL CORRELATION\n{'=' * 62}")
@@ -343,7 +474,8 @@ def main() -> None:
 
     plot(roll, full, a.out, a.roll_window,
          None if a.no_regimes else R.REGIMES,
-         spot=None if a.no_spot else df["spot"], implied=not a.no_implied)
+         spot=None if a.no_spot else df["spot"], implied=not a.no_implied,
+         log_spot=a.log_spot)
     if a.csv:
         df.join(roll.add_prefix("roll_")).to_csv(a.csv)
         print(f"saved -> {a.csv}")

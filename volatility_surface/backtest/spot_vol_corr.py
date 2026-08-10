@@ -187,7 +187,12 @@ def build(option_path: str, perp_path: str, target_days: float = 30.0,
     for c in rv.columns:
         df[c] = rv[c]
         df["d_" + c] = rv[c].diff()
-    return df.dropna(subset=["ret"])
+    df = df.dropna(subset=["ret"])
+    # carried so the plots can LABEL themselves from the data. A plot argument
+    # saying "30d trailing window" is free to contradict a frame built with
+    # rv_window=1; reading it back off the frame cannot.
+    df.attrs.update(rv_window=rv_window, bar_freq=bar_freq, target_days=target_days)
+    return df
 
 
 def rv_columns(df: pd.DataFrame) -> list[str]:
@@ -270,14 +275,19 @@ def _backdrop(ax, regimes: dict | None, spot: pd.Series | None,
     return handles
 
 
-def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
+def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str | None = None,
          window_days: int = 90, regimes: dict | None = None,
          spot: pd.Series | None = None, implied: bool = True,
-         log_spot: bool = False) -> None:
+         log_spot: bool = False):
     """Rolling correlations on the left axis; optionally the spot on a twin
-    right axis for context."""
-    import matplotlib
-    matplotlib.use("Agg")
+    right axis for context. Returns the figure, and saves it if `out_path` is given.
+
+    Deliberately does NOT call `matplotlib.use("Agg")`: that switch is sticky for
+    the whole kernel and unregisters Jupyter's figure formatter, so a notebook
+    caller gets `<Figure size ...>` text instead of a plot. `main()` sets Agg
+    because a CLI run has no display; a library function must not decide that for
+    its caller.
+    """
     import matplotlib.pyplot as plt
     from volatility_surface.plots.vol_plots import PALETTE
 
@@ -316,8 +326,10 @@ def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
               framealpha=0.92, ncol=2)
     ax.grid(alpha=0.25, lw=0.5)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=140)
-    print(f"saved -> {out_path}")
+    if out_path:
+        fig.savefig(out_path, dpi=140)
+        print(f"saved -> {out_path}")
+    return fig
 
 
 # --------------------------------------------------------------------------- #
@@ -352,10 +364,10 @@ def levels(df: pd.DataFrame) -> pd.DataFrame:
     return out.round(2)
 
 
-def plot_levels(df: pd.DataFrame, out_path: str, regimes: dict | None = None,
-                spot: bool = True, log_spot: bool = False, implied: bool = True,
-                window_days: int | None = None, bar_freq: str | None = None,
-                target_days: float = 30.0) -> None:
+def plot_levels(df: pd.DataFrame, out_path: str | None = None,
+                regimes: dict | None = None,
+                spot: bool = True, log_spot: bool = False,
+                implied: bool = True) -> None:
     """Annualised vol per estimator on the left axis, spot on the right.
 
     Implied is drawn heaviest and in black because the quantity of interest is
@@ -363,9 +375,15 @@ def plot_levels(df: pd.DataFrame, out_path: str, regimes: dict | None = None,
     be the first thing the eye lands on. `rv_close` comes first among the
     realised lines and stays solid: it is the reference the others are read
     against, not one dashed line among four.
+
+    The window and bar frequency in the title are read from `df.attrs`, set by
+    `build`. They are NOT arguments: nothing here smooths anything, so a caller
+    passing a window length could only ever mislabel the chart — the smoothing
+    already happened in `build(rv_window=...)`.
+
+    Returns the figure, and saves it if `out_path` is given. See `plot` for why
+    the backend is left alone.
     """
-    import matplotlib
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from volatility_surface.plots.vol_plots import PALETTE
 
@@ -387,23 +405,29 @@ def plot_levels(df: pd.DataFrame, out_path: str, regimes: dict | None = None,
         lines.append(l)
 
     if implied and "iv" in df:
+        tgt = df.attrs.get("target_days", 30.0)
         l, = ax.plot(df.index, df["iv"] * 100, color="black", lw=2.0, zorder=5,
-                     label=f"implied ATM {target_days:.0f}d   mean {df['iv'].mean():.1%}")
+                     label=f"implied ATM {tgt:.0f}d   mean {df['iv'].mean():.1%}")
         lines.insert(0, l)
 
+    w, bf = df.attrs.get("rv_window"), df.attrs.get("bar_freq")
     ax.set_ylabel("annualised volatility (%)")
     ax.set_title("Volatility levels"
-                 + (f" — {window_days}d trailing window" if window_days else "")
-                 + (f", {bar_freq} bars" if bar_freq else ""))
+                 + (f" — {w}d trailing window" if w else "")
+                 + (f", {bf} bars" if bf else ""))
     ax.legend(handles=lines + handles, loc="upper right", fontsize=7.5,
               framealpha=0.92, ncol=2)
     ax.grid(alpha=0.25, lw=0.5)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=140)
-    print(f"saved -> {out_path}")
+    if out_path:
+        fig.savefig(out_path, dpi=140)
+        print(f"saved -> {out_path}")
+    return fig
 
 
 def main() -> None:
+    import matplotlib
+    matplotlib.use("Agg")          # CLI run: no display to draw into
     from volatility_surface.backtest import roll_engine as R
 
     ap = argparse.ArgumentParser(description=__doc__,
@@ -454,8 +478,7 @@ def main() -> None:
         print("             row is harvestable by a hedger at this frequency.")
         plot_levels(df, a.out, None if a.no_regimes else R.REGIMES,
                     spot=not a.no_spot, log_spot=a.log_spot,
-                    implied=not a.no_implied, window_days=a.rv_window,
-                    bar_freq=a.bar_freq, target_days=a.target_days)
+                    implied=not a.no_implied)
         if a.csv:
             df.to_csv(a.csv)
             print(f"saved -> {a.csv}")

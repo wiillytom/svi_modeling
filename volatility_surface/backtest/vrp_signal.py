@@ -81,16 +81,94 @@ def perp_log_returns(perp_path: str, freq: str = "1h") -> pd.Series:
 #: kept so older callers/notebooks keep working
 hourly_log_returns = perp_log_returns
 
+#: Per-bar variance estimators. "close" is the DEFAULT and the one that matches
+#: what a delta-hedged strategy actually earns: the P&L of a discretely hedged
+#: option tracks the quadratic variation SAMPLED AT ITS HEDGING FREQUENCY, not
+#: the latent continuous volatility. The range estimators (Parkinson,
+#: Garman-Klass, Rogers-Satchell) estimate that latent quantity far more
+#: efficiently — and on ETH 2024-2026 they read 4-6 vol points HIGHER than
+#: close-to-close. That gap is not an error in either: it is the variation
+#: occurring INSIDE the hedging interval, which an hourly hedger never
+#: monetises. Comparing them therefore quantifies the discretisation loss.
+#:
+#: TWO BIASES PULL THE RANGE ESTIMATORS IN OPPOSITE DIRECTIONS — read them as a
+#: cross-check, never as ground truth:
+#:
+#: 1. DISCRETE SAMPLING, downward. The formulas assume the CONTINUOUS high and
+#:    low; a high/low taken from finitely many observations always misses the
+#:    true extremes. Measured on a GBM of known 60% vol, by sub-steps per bar:
+#:
+#:        sub-steps   close   parkinson   garman_klass   rogers_satchell
+#:               12   59.6%       47.2%          42.6%             42.0%
+#:               60   60.1%       54.6%          52.6%             52.4%
+#:              600   60.1%       58.3%          57.7%             57.6%
+#:             3600   59.7%       59.3%          59.1%             59.1%
+#:
+#:    1-minute data aggregated to hourly bars is the 60 row: the range figures
+#:    run ~10% LOW. `close` is unbiased at every resolution.
+#:
+#: 2. LIQUIDATION WICKS, upward. Crypto perp highs and lows include prices
+#:    touched for a second during a cascade, at levels where no size traded.
+#:
+#: The two partly cancel and cannot be separated from this data. For a clean
+#: read on how much variation lives at each timescale, sweep `close` across
+#: `rv_freq` instead — it is unbiased everywhere, so the comparison is honest.
+ESTIMATORS = ("close", "parkinson", "garman_klass", "rogers_satchell")
 
-def realised_vol(rets: pd.Series, t0: pd.Timestamp, t1: pd.Timestamp) -> float:
-    """Annualised realised vol over [t0, t1) at the series' own frequency."""
-    seg = rets[(rets.index >= t0) & (rets.index < t1)]
-    periods = rets.attrs.get("periods", 8_760)
-    # need enough points to estimate a std at all — scale the floor with the
-    # sampling frequency rather than hard-coding an hourly assumption
+
+def perp_variance(perp_path: str, freq: str = "1h",
+                  estimator: str = "close") -> pd.Series:
+    """Per-bar variance contribution, so that annualised RV over any window is
+    sqrt(mean(contributions) * periods). Carries `periods` and `estimator` in
+    `.attrs` so downstream code needs no second argument."""
+    if freq not in _PERIODS:
+        raise ValueError(f"freq must be one of {list(_PERIODS)}")
+    if estimator not in ESTIMATORS:
+        raise ValueError(f"estimator must be one of {list(ESTIMATORS)}")
+
+    d = pd.read_parquet(perp_path)
+    d["dt"] = pd.to_datetime(d["timestamp_ms"], unit="ms", utc=True)
+    d = d.set_index("dt")
+    need = ["open", "high", "low", "close"] if estimator != "close" else ["close"]
+    missing = [c for c in need if c not in d.columns]
+    if missing:
+        raise KeyError(f"estimator {estimator!r} needs {missing}, absent from {perp_path}")
+
+    if estimator == "close":
+        c = d["close"].resample(freq).last().dropna()
+        v = np.log(c / c.shift(1)) ** 2
+    else:
+        b = d.resample(freq).agg({"open": "first", "high": "max",
+                                  "low": "min", "close": "last"}).dropna()
+        hl = np.log(b["high"] / b["low"])
+        if estimator == "parkinson":
+            v = hl ** 2 / (4.0 * np.log(2.0))
+        elif estimator == "garman_klass":
+            co = np.log(b["close"] / b["open"])
+            v = 0.5 * hl ** 2 - (2.0 * np.log(2.0) - 1.0) * co ** 2
+        else:  # rogers_satchell — unbiased under a non-zero drift
+            v = (np.log(b["high"] / b["close"]) * np.log(b["high"] / b["open"])
+                 + np.log(b["low"] / b["close"]) * np.log(b["low"] / b["open"]))
+    v = v.dropna()
+    v.attrs["periods"] = _PERIODS[freq]
+    v.attrs["estimator"] = estimator
+    v.attrs["freq"] = freq
+    return v
+
+
+def realised_vol(x: pd.Series, t0: pd.Timestamp, t1: pd.Timestamp) -> float:
+    """Annualised realised vol over [t0, t1).
+
+    Accepts either a per-bar variance series from `perp_variance` (preferred) or
+    a plain log-return series from `perp_log_returns` (the original interface,
+    kept so existing callers and notebooks keep working)."""
+    seg = x[(x.index >= t0) & (x.index < t1)]
+    periods = x.attrs.get("periods", 8_760)
     if len(seg) < max(10, periods // 365):
         return np.nan
-    return float(seg.std(ddof=1) * np.sqrt(periods))
+    if x.attrs.get("estimator"):                      # variance contributions
+        return float(np.sqrt(max(seg.mean(), 0.0) * periods))
+    return float(seg.std(ddof=1) * np.sqrt(periods))  # raw returns
 
 
 # --------------------------------------------------------------------------- #
@@ -224,9 +302,9 @@ def regime_skew_table(option_path: str, perp_path: str,
 
 
 def build_panel(option_path: str, perp_path: str, frequency: str = "weekly",
-                rv_freq: str = "1h") -> pd.DataFrame:
+                rv_freq: str = "1h", estimator: str = "close") -> pd.DataFrame:
     """One row per roll: IV, past RV, forward RV, premium and signal."""
-    rets = perp_log_returns(perp_path, freq=rv_freq)
+    rets = perp_variance(perp_path, freq=rv_freq, estimator=estimator)
     lo = int(rets.index[0].timestamp() * 1000)
     hi = int(rets.index[-1].timestamp() * 1000)
     grid = R.roll_grid(lo, hi, frequency)
@@ -302,6 +380,39 @@ def threshold_table(df: pd.DataFrame, thresholds=(-0.10, -0.05, 0.0, 0.05, 0.10)
               f"{_tstat(seg):>7.2f} {float((seg > 0).mean()):>8.0%}")
 
 
+def compare_estimators(option_path: str, perp_path: str, frequency: str = "weekly",
+                       rv_freq: str = "1h",
+                       estimators: tuple[str, ...] = ESTIMATORS) -> pd.DataFrame:
+    """The same premium measurement under each realised-vol estimator.
+
+    `close` is what a delta-hedged strategy at `rv_freq` actually earns. The
+    range estimators approximate the latent volatility, so
+    `premium(close) - premium(range)` is the part of the underlying's movement
+    that happens between hedges and is therefore never captured — a number worth
+    reporting rather than an order of magnitude.
+    """
+    rows = []
+    for est in estimators:
+        try:
+            df = build_panel(option_path, perp_path, frequency, rv_freq, estimator=est)
+        except KeyError as e:
+            # a perp file without OHLC supports `close` only — skip the range
+            # estimators rather than aborting a run that already did real work
+            print(f"  [skip] {est}: {e}")
+            continue
+        if df.empty:
+            continue
+        p = df["premium"].to_numpy()
+        se = p.std(ddof=1) / np.sqrt(len(p))
+        rows.append({"estimator": est, "n": len(p),
+                     "mean_iv": df["iv"].mean(), "mean_rv_fut": df["rv_fut"].mean(),
+                     "premium": p.mean(), "t_stat": p.mean() / se if se else np.nan})
+    out = pd.DataFrame(rows).set_index("estimator")
+    if "close" in out.index:
+        out["vs_close"] = out["premium"] - out.loc["close", "premium"]
+    return out.round(4)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -312,10 +423,29 @@ def main() -> None:
                     help="sampling frequency for realised vol (default 1h, matching "
                          "roll_engine's hourly delta hedge)")
     ap.add_argument("--csv", default=None, help="write the per-roll panel here")
+    ap.add_argument("--estimator", default="close", choices=list(ESTIMATORS),
+                    help="realised-vol estimator (default close = what a discretely "
+                         "hedged strategy earns)")
+    ap.add_argument("--compare-estimators", action="store_true",
+                    help="run the premium measurement under every estimator")
     ap.add_argument("--skew", action="store_true",
                     help="report implied skew vs realised asymmetry per regime instead "
                          "of the premium/predictability tests")
     a = ap.parse_args()
+
+    if a.compare_estimators:
+        t = compare_estimators(a.options, a.perp, a.frequency, a.rv_frequency)
+        print(f"\n{'=' * 78}\nPREMIUM UNDER EACH REALISED-VOL ESTIMATOR  "
+              f"[rolls: {a.frequency} | bars: {a.rv_frequency}]\n{'=' * 78}")
+        print(t.to_string())
+        print("\n  close        = quadratic variation at the hedging frequency -> what a")
+        print("                 discretely hedged position actually earns.")
+        print("  range others = latent volatility, estimated more efficiently.")
+        print("  vs_close     = the discretisation loss: movement occurring between")
+        print("                 hedges, which no hourly hedger monetises.")
+        if a.csv:
+            t.to_csv(a.csv); print(f"\nsaved -> {a.csv}")
+        return
 
     if a.skew:
         tbl = regime_skew_table(a.options, a.perp, R.REGIMES,
@@ -337,7 +467,8 @@ def main() -> None:
             print(f"\nsaved -> {a.csv}")
         return
 
-    df = build_panel(a.options, a.perp, a.frequency, rv_freq=a.rv_frequency)
+    df = build_panel(a.options, a.perp, a.frequency, rv_freq=a.rv_frequency,
+                     estimator=a.estimator)
     if df.empty:
         print("no usable rolls — check that the option file covers the perp's range")
         return

@@ -166,30 +166,56 @@ def rolling(df: pd.DataFrame, window_days: int = 90) -> pd.DataFrame:
 
 
 def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
-         window_days: int = 90, regimes: dict | None = None) -> None:
+         window_days: int = 90, regimes: dict | None = None,
+         spot: pd.Series | None = None) -> None:
+    """Rolling correlations on the left axis; optionally the spot on a twin
+    right axis for context.
+
+    The spot is drawn in grey and behind the correlations on purpose: it is
+    there to read the correlations against, not as a third signal competing for
+    attention. Regime bands get explicit legend entries — without them the two
+    shades are indistinguishable at low alpha and the reader cannot tell a bull
+    band from a bear band, or either from an unclassified gap.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
     from volatility_surface.plots.vol_plots import PALETTE
 
-    fig, ax = plt.subplots(figsize=(12, 5))
+    BULL, BEAR = PALETTE[1], PALETTE[6]
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+
+    handles = []
     if regimes:
         for name, (a, b) in regimes.items():
+            is_bull = name.startswith("bull")
             ax.axvspan(pd.Timestamp(a, tz="UTC"), pd.Timestamp(b, tz="UTC"),
-                       color=PALETTE[1] if name.startswith("bull") else PALETTE[5],
-                       alpha=0.12, lw=0)
-            ax.text(pd.Timestamp(a, tz="UTC"), 0.97, name, fontsize=7,
-                    color="grey", va="top", ha="left", transform=ax.get_xaxis_transform())
+                       color=BULL if is_bull else BEAR, alpha=0.22 if is_bull else 0.13, lw=0)
+        handles += [Patch(facecolor=BULL, alpha=0.22, label="bull regime"),
+                    Patch(facecolor=BEAR, alpha=0.13, label="bear regime"),
+                    Patch(facecolor="white", edgecolor="lightgrey", label="unclassified")]
 
-    ax.plot(roll.index, roll["implied"], color=PALETTE[6], lw=1.6,
-            label=f"implied — corr(spot ret, ΔIV)   full: {full.loc['implied  corr(ret, d_IV)', 'corr']:+.2f}")
-    ax.plot(roll.index, roll["realised"], color=PALETTE[3], lw=1.3, ls="--",
-            label=f"realised — corr(spot ret, ΔRV)  full: {full.loc['realised corr(ret, d_RV)', 'corr']:+.2f}")
-    ax.axhline(0, color="grey", lw=0.8)
+    if spot is not None:
+        ax2 = ax.twinx()
+        ax2.plot(spot.index, spot.values, color="0.45", lw=1.0, alpha=0.75, zorder=1)
+        ax2.set_ylabel("spot (USD)", color="0.35")
+        ax2.tick_params(axis="y", labelcolor="0.35")
+        ax2.set_zorder(1)
+        ax.set_zorder(2)
+        ax.patch.set_visible(False)   # else the left axes' background hides the spot
+        handles.append(plt.Line2D([], [], color="0.45", lw=1.0, label="spot (right axis)"))
+
+    l1, = ax.plot(roll.index, roll["implied"], color=PALETTE[6], lw=1.8, zorder=3,
+                  label=f"implied  corr(ret, ΔIV)   full {full.loc['implied  corr(ret, d_IV)', 'corr']:+.2f}")
+    l2, = ax.plot(roll.index, roll["realised"], color=PALETTE[3], lw=1.4, ls="--", zorder=3,
+                  label=f"realised corr(ret, ΔRV)  full {full.loc['realised corr(ret, d_RV)', 'corr']:+.2f}")
+    ax.axhline(0, color="grey", lw=0.8, zorder=2)
     ax.set_ylim(-1, 1)
     ax.set_ylabel("correlation")
     ax.set_title(f"Spot–vol correlation, {window_days}-day rolling window")
-    ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
+    ax.legend(handles=[l1, l2] + handles, loc="lower left", fontsize=8,
+              framealpha=0.92, ncol=2)
     ax.grid(alpha=0.25, lw=0.5)
     fig.tight_layout()
     fig.savefig(out_path, dpi=140)
@@ -211,6 +237,8 @@ def main() -> None:
     ap.add_argument("--out", default="spot_vol_corr.png")
     ap.add_argument("--csv", default=None)
     ap.add_argument("--no-regimes", action="store_true")
+    ap.add_argument("--no-spot", action="store_true",
+                    help="omit the spot on the right axis")
     a = ap.parse_args()
 
     df = build(a.options, a.perp, a.target_days, a.resample, a.rv_window)
@@ -230,7 +258,8 @@ def main() -> None:
     print(roll.describe().round(3).to_string())
 
     plot(roll, full, a.out, a.roll_window,
-         None if a.no_regimes else R.REGIMES)
+         None if a.no_regimes else R.REGIMES,
+         spot=None if a.no_spot else df["spot"])
     if a.csv:
         df.join(roll.add_prefix("roll_")).to_csv(a.csv)
         print(f"saved -> {a.csv}")

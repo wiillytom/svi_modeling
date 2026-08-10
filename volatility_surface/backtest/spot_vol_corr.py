@@ -124,19 +124,62 @@ def perp_at_times(perp_path: str, stamps_ms: pd.Series) -> pd.Series:
 # --------------------------------------------------------------------------- #
 # Correlations
 # --------------------------------------------------------------------------- #
+def realised_vol_by_estimator(perp_path: str, index: pd.DatetimeIndex,
+                              estimators: tuple[str, ...], window_days: int = 30,
+                              bar_freq: str = "1h") -> pd.DataFrame:
+    """Trailing realised vol at each point of `index`, one column per estimator.
+
+    Built from `vrp_signal.perp_variance` so there is a single implementation of
+    each estimator in the project. The rolling window is TIME-based, not a count
+    of bars, so a gap in the perp shortens the sample rather than silently
+    reaching further back than intended.
+
+    Estimators needing OHLC are skipped (with a note) when the perp file has only
+    closes, instead of aborting the whole build.
+    """
+    from volatility_surface.backtest import vrp_signal as V
+
+    out = {}
+    for est in estimators:
+        try:
+            v = V.perp_variance(perp_path, freq=bar_freq, estimator=est)
+        except KeyError as e:
+            print(f"  [skip] {est}: {e}")
+            continue
+        per = v.attrs["periods"]
+        rv = np.sqrt(v.rolling(f"{window_days}D").mean().clip(lower=0) * per)
+        # asof onto the option-snapshot grid: value AT OR BEFORE each stamp, so
+        # the vol never contains a bar the snapshot could not have seen
+        out[f"rv_{est}"] = rv.reindex(rv.index.union(index)).ffill().reindex(index)
+    return pd.DataFrame(out, index=index)
+
+
 def build(option_path: str, perp_path: str, target_days: float = 30.0,
-          resample: str = "1D", rv_window: int = 30) -> pd.DataFrame:
+          resample: str = "1D", rv_window: int = 30,
+          estimators: tuple[str, ...] = ("close",), bar_freq: str = "1h") -> pd.DataFrame:
+    """Panel of spot, implied vol and realised vol (one column per estimator),
+    all sampled at the option-snapshot instants.
+
+    `rv_window` is in DAYS (it used to be a count of observations; with several
+    bar frequencies in play a count is ambiguous).
+    """
     iv = atm_iv_constant_maturity(option_path, target_days, resample)
     if iv.empty:
         return pd.DataFrame()
     spot = perp_at_times(perp_path, iv.attrs["stamps"])
-    per = {"1D": 365, "1h": 8760}.get(resample, 365)
     df = pd.DataFrame({"spot": spot, "iv": iv})
     df["ret"] = np.log(df["spot"] / df["spot"].shift(1))
-    df["rv"] = df["ret"].rolling(rv_window).std() * np.sqrt(per)
     df["d_iv"] = df["iv"].diff()
-    df["d_rv"] = df["rv"].diff()
+
+    rv = realised_vol_by_estimator(perp_path, df.index, estimators, rv_window, bar_freq)
+    for c in rv.columns:
+        df[c] = rv[c]
+        df["d_" + c] = rv[c].diff()
     return df.dropna(subset=["ret"])
+
+
+def rv_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c.startswith("rv_")]
 
 
 def _corr_t(x: pd.Series, y: pd.Series) -> tuple[float, float, int]:
@@ -150,19 +193,27 @@ def _corr_t(x: pd.Series, y: pd.Series) -> tuple[float, float, int]:
 
 
 def full_window(df: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for lbl, col in [("implied  corr(ret, d_IV)", "d_iv"),
-                     ("realised corr(ret, d_RV)", "d_rv")]:
-        c, t, n = _corr_t(df["ret"], df[col])
-        rows.append({"measure": lbl, "corr": round(c, 4), "t_stat": round(t, 2), "n": n})
-    return pd.DataFrame(rows).set_index("measure")
+    """One row for the implied correlation, one per realised-vol estimator.
+
+    The estimators disagree on the LEVEL of vol (range estimators run ~10% low
+    at 1-min-into-hourly resolution, see vrp_signal.ESTIMATORS), but the
+    correlation is scale-free — so a spread across estimators here is about the
+    SHAPE of the vol response to spot, not about that level bias."""
+    rows = [{"measure": "implied  corr(ret, dIV)", **dict(zip(
+        ("corr", "t_stat", "n"), _corr_t(df["ret"], df["d_iv"])))}]
+    for c in rv_columns(df):
+        est = c[3:]
+        rows.append({"measure": f"realised corr(ret, dRV) [{est}]",
+                     **dict(zip(("corr", "t_stat", "n"), _corr_t(df["ret"], df["d_" + c])))})
+    out = pd.DataFrame(rows).set_index("measure")
+    return out.assign(corr=out["corr"].round(4), t_stat=out["t_stat"].round(2))
 
 
 def rolling(df: pd.DataFrame, window_days: int = 90) -> pd.DataFrame:
-    return pd.DataFrame({
-        "implied": df["ret"].rolling(window_days).corr(df["d_iv"]),
-        "realised": df["ret"].rolling(window_days).corr(df["d_rv"]),
-    })
+    cols = {"implied": df["ret"].rolling(window_days).corr(df["d_iv"])}
+    for c in rv_columns(df):
+        cols[c[3:]] = df["ret"].rolling(window_days).corr(df["d_" + c])
+    return pd.DataFrame(cols)
 
 
 def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
@@ -206,15 +257,24 @@ def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
         ax.patch.set_visible(False)   # else the left axes' background hides the spot
         handles.append(plt.Line2D([], [], color="0.45", lw=1.0, label="spot (right axis)"))
 
-    l1, = ax.plot(roll.index, roll["implied"], color=PALETTE[6], lw=1.8, zorder=3,
-                  label=f"implied  corr(ret, ΔIV)   full {full.loc['implied  corr(ret, d_IV)', 'corr']:+.2f}")
-    l2, = ax.plot(roll.index, roll["realised"], color=PALETTE[3], lw=1.4, ls="--", zorder=3,
-                  label=f"realised corr(ret, ΔRV)  full {full.loc['realised corr(ret, d_RV)', 'corr']:+.2f}")
+    lines = []
+    fi = full["corr"].to_dict()
+    l, = ax.plot(roll.index, roll["implied"], color=PALETTE[6], lw=1.9, zorder=4,
+                 label=f"implied  ΔIV   full {fi.get('implied  corr(ret, dIV)', float('nan')):+.2f}")
+    lines.append(l)
+    styles = ["--", "-.", ":", (0, (3, 1, 1, 1))]
+    shades = [PALETTE[3], PALETTE[2], PALETTE[4], PALETTE[1]]
+    for i, est in enumerate([c for c in roll.columns if c != "implied"]):
+        l, = ax.plot(roll.index, roll[est], color=shades[i % len(shades)], lw=1.2,
+                     ls=styles[i % len(styles)], zorder=3,
+                     label=f"realised ΔRV [{est}]  full "
+                           f"{fi.get(f'realised corr(ret, dRV) [{est}]', float('nan')):+.2f}")
+        lines.append(l)
     ax.axhline(0, color="grey", lw=0.8, zorder=2)
     ax.set_ylim(-1, 1)
     ax.set_ylabel("correlation")
     ax.set_title(f"Spot–vol correlation, {window_days}-day rolling window")
-    ax.legend(handles=[l1, l2] + handles, loc="lower left", fontsize=8,
+    ax.legend(handles=lines + handles, loc="lower left", fontsize=7.5,
               framealpha=0.92, ncol=2)
     ax.grid(alpha=0.25, lw=0.5)
     fig.tight_layout()
@@ -232,7 +292,12 @@ def main() -> None:
     ap.add_argument("--target-days", type=float, default=30.0,
                     help="constant maturity for the implied vol series (default 30)")
     ap.add_argument("--resample", default="1D", help="1D or 1h")
-    ap.add_argument("--rv-window", type=int, default=30, help="periods for realised vol")
+    ap.add_argument("--rv-window", type=int, default=30,
+                    help="trailing window IN DAYS for realised vol")
+    ap.add_argument("--estimators", default="close",
+                    help="comma-separated realised-vol estimators, or 'all' "
+                         "(close,parkinson,garman_klass,rogers_satchell)")
+    ap.add_argument("--bar-freq", default="1h", help="bar frequency the estimators run on")
     ap.add_argument("--roll-window", type=int, default=90, help="rolling correlation window")
     ap.add_argument("--out", default="spot_vol_corr.png")
     ap.add_argument("--csv", default=None)
@@ -241,10 +306,15 @@ def main() -> None:
                     help="omit the spot on the right axis")
     a = ap.parse_args()
 
-    df = build(a.options, a.perp, a.target_days, a.resample, a.rv_window)
+    from volatility_surface.backtest.vrp_signal import ESTIMATORS
+    ests = ESTIMATORS if a.estimators == "all" else tuple(
+        e.strip() for e in a.estimators.split(","))
+    df = build(a.options, a.perp, a.target_days, a.resample, a.rv_window,
+               estimators=ests, bar_freq=a.bar_freq)
     print(f"\n{len(df)} observations, {df.index[0]:%Y-%m-%d} -> {df.index[-1]:%Y-%m-%d}")
-    print(f"ATM IV at constant {a.target_days:.0f}d: mean {df['iv'].mean():.1%}, "
-          f"realised vol ({a.rv_window}p): mean {df['rv'].mean():.1%}")
+    print(f"ATM IV at constant {a.target_days:.0f}d: mean {df['iv'].mean():.1%}")
+    for c in rv_columns(df):
+        print(f"  {c:26s} mean {df[c].mean():.1%}")
 
     full = full_window(df)
     print(f"\n{'=' * 62}\nFULL-WINDOW SPOT-VOL CORRELATION\n{'=' * 62}")

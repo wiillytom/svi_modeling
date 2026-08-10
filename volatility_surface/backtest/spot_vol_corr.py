@@ -218,7 +218,7 @@ def rolling(df: pd.DataFrame, window_days: int = 90) -> pd.DataFrame:
 
 def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
          window_days: int = 90, regimes: dict | None = None,
-         spot: pd.Series | None = None) -> None:
+         spot: pd.Series | None = None, implied: bool = True) -> None:
     """Rolling correlations on the left axis; optionally the spot on a twin
     right axis for context.
 
@@ -259,9 +259,10 @@ def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
 
     lines = []
     fi = full["corr"].to_dict()
-    l, = ax.plot(roll.index, roll["implied"], color=PALETTE[6], lw=1.9, zorder=4,
-                 label=f"implied  ΔIV   full {fi.get('implied  corr(ret, dIV)', float('nan')):+.2f}")
-    lines.append(l)
+    if implied:
+        l, = ax.plot(roll.index, roll["implied"], color=PALETTE[6], lw=1.9, zorder=4,
+                     label=f"implied  ΔIV   full {fi.get('implied  corr(ret, dIV)', float('nan')):+.2f}")
+        lines.append(l)
     styles = ["--", "-.", ":", (0, (3, 1, 1, 1))]
     shades = [PALETTE[3], PALETTE[2], PALETTE[4], PALETTE[1]]
     for i, est in enumerate([c for c in roll.columns if c != "implied"]):
@@ -271,7 +272,17 @@ def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str,
                            f"{fi.get(f'realised corr(ret, dRV) [{est}]', float('nan')):+.2f}")
         lines.append(l)
     ax.axhline(0, color="grey", lw=0.8, zorder=2)
-    ax.set_ylim(-1, 1)
+    if implied:
+        ax.set_ylim(-1, 1)
+    else:
+        # the implied correlation sits near -1 and squashes everything else onto
+        # a sliver of the axis; without it, scale to what is actually plotted
+        vals = roll[[c for c in roll.columns if c != "implied"]].to_numpy()
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            lo, hi = float(vals.min()), float(vals.max())
+            pad = max(0.05, 0.15 * (hi - lo))
+            ax.set_ylim(max(-1.0, lo - pad), min(1.0, hi + pad))
     ax.set_ylabel("correlation")
     ax.set_title(f"Spot–vol correlation, {window_days}-day rolling window")
     ax.legend(handles=lines + handles, loc="lower left", fontsize=7.5,
@@ -304,6 +315,9 @@ def main() -> None:
     ap.add_argument("--no-regimes", action="store_true")
     ap.add_argument("--no-spot", action="store_true",
                     help="omit the spot on the right axis")
+    ap.add_argument("--no-implied", action="store_true",
+                    help="omit the implied (ΔIV) line; the y-axis then scales to "
+                         "the realised correlations instead of staying on [-1, 1]")
     a = ap.parse_args()
 
     from volatility_surface.backtest.vrp_signal import ESTIMATORS
@@ -329,7 +343,7 @@ def main() -> None:
 
     plot(roll, full, a.out, a.roll_window,
          None if a.no_regimes else R.REGIMES,
-         spot=None if a.no_spot else df["spot"])
+         spot=None if a.no_spot else df["spot"], implied=not a.no_implied)
     if a.csv:
         df.join(roll.add_prefix("roll_")).to_csv(a.csv)
         print(f"saved -> {a.csv}")

@@ -227,10 +227,87 @@ def full_window(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def rolling(df: pd.DataFrame, window_days: int = 90) -> pd.DataFrame:
+    """Rolling correlation of the return against each vol change.
+
+    `window_days` is a COUNT OF OBSERVATIONS (pandas integer rolling), equal to
+    days only because `resample` defaults to "1D" — set `resample="1h"` and 90
+    becomes 3.75 days. Kept as a count rather than silently changed, because the
+    statistic that matters is the sample size: below ~30 the estimate cannot
+    resolve a correlation smaller than 0.36 and degenerates into a +/-1 sawtooth.
+
+    The window is recorded in `.attrs` so `plot` can title itself from the data
+    instead of taking a caller's word for it.
+    """
     cols = {"implied": df["ret"].rolling(window_days).corr(df["d_iv"])}
     for c in rv_columns(df):
         cols[c[3:]] = df["ret"].rolling(window_days).corr(df["d_" + c])
-    return pd.DataFrame(cols)
+    out = pd.DataFrame(cols)
+    out.attrs.update(roll_window=window_days, rv_window=df.attrs.get("rv_window"),
+                     bar_freq=df.attrs.get("bar_freq"))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Notebook display
+# --------------------------------------------------------------------------- #
+# Getting a figure to appear in Jupyter cost a long debugging session, so the
+# mechanics are spelled out here rather than left implicit:
+#
+#   * `matplotlib.use("Agg")` is PROCESS-WIDE and STICKY. One call anywhere in an
+#     imported module switches the whole kernel to a headless backend, and it
+#     survives a later `%matplotlib inline` unreliably. A library function must
+#     never call it — only `main()` does, where there is genuinely no display.
+#   * Under Agg, `plt.show()` is a silent no-op AND Jupyter's Figure formatter is
+#     unregistered, so even `return fig` renders as `<Figure size ...>` text.
+#     Nothing about the plotting code is wrong at that point; the backend is.
+#   * `_ensure_inline` therefore repairs a poisoned kernel in place, so a stale
+#     `Agg` from an earlier import cannot silently swallow every plot.
+def _in_notebook() -> bool:
+    """True only in a Jupyter/ZMQ kernel — not in a terminal IPython, not in a
+    plain script, where `display()` would do nothing useful."""
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        return ip is not None and type(ip).__name__ == "ZMQInteractiveShell"
+    except Exception:
+        return False
+
+
+def _ensure_inline() -> None:
+    """Put a notebook kernel back on the inline backend if something switched it
+    to Agg. Silent no-op outside notebooks, and when inline is already active."""
+    if not _in_notebook():
+        return
+    import matplotlib
+    if "inline" in matplotlib.get_backend().lower():
+        return
+    try:
+        matplotlib.use("module://matplotlib_inline.backend_inline", force=True)
+    except Exception:
+        pass          # matplotlib-inline absent: nothing we can do from here
+
+
+def _show(fig):
+    """Display `fig` in a notebook; return it only outside one.
+
+    Returning the figure in a notebook would render the chart TWICE — once from
+    the explicit `display`, once from Jupyter echoing the cell's result through
+    the Figure formatter (measured: 2 images per call). Relying on the inline
+    backend's own end-of-cell flush instead is not a fix either: that gives one
+    image when the result is assigned and two when the call is the last
+    expression. Displaying explicitly, closing, and returning None is the only
+    combination that yields exactly one image in both cases.
+
+    Outside a notebook the figure IS returned, so scripts can keep tweaking or
+    saving it.
+    """
+    if not _in_notebook():
+        return fig
+    from IPython.display import display
+    import matplotlib.pyplot as plt
+    display(fig)
+    plt.close(fig)          # else the inline flush re-renders it at end of cell
+    return None
 
 
 def _backdrop(ax, regimes: dict | None, spot: pd.Series | None,
@@ -276,18 +353,20 @@ def _backdrop(ax, regimes: dict | None, spot: pd.Series | None,
 
 
 def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str | None = None,
-         window_days: int = 90, regimes: dict | None = None,
+         window_days: int | None = None, regimes: dict | None = None,
          spot: pd.Series | None = None, implied: bool = True,
          log_spot: bool = False):
     """Rolling correlations on the left axis; optionally the spot on a twin
     right axis for context. Returns the figure, and saves it if `out_path` is given.
 
-    Deliberately does NOT call `matplotlib.use("Agg")`: that switch is sticky for
-    the whole kernel and unregisters Jupyter's figure formatter, so a notebook
-    caller gets `<Figure size ...>` text instead of a plot. `main()` sets Agg
-    because a CLI run has no display; a library function must not decide that for
-    its caller.
+    `window_days` is only the TITLE label and defaults to whatever `rolling`
+    recorded in `roll.attrs` — passing it is a way to make the chart claim a
+    window the data does not have. Left in the signature for callers holding a
+    `roll` frame whose attrs were lost, but prefer to omit it.
     """
+    if window_days is None:
+        window_days = roll.attrs.get("roll_window")
+    _ensure_inline()
     import matplotlib.pyplot as plt
     from volatility_surface.plots.vol_plots import PALETTE
 
@@ -321,7 +400,10 @@ def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str | None = None,
             pad = max(0.05, 0.15 * (hi - lo))
             ax.set_ylim(max(-1.0, lo - pad), min(1.0, hi + pad))
     ax.set_ylabel("correlation")
-    ax.set_title(f"Spot–vol correlation, {window_days}-day rolling window")
+    rvw, bf = roll.attrs.get("rv_window"), roll.attrs.get("bar_freq")
+    ax.set_title("Spot–vol correlation"
+                 + (f", {window_days}-observation rolling window" if window_days else "")
+                 + (f"  |  {rvw}d realised vol on {bf} bars" if rvw and bf else ""))
     ax.legend(handles=lines + handles, loc="lower left", fontsize=7.5,
               framealpha=0.92, ncol=2)
     ax.grid(alpha=0.25, lw=0.5)
@@ -329,7 +411,7 @@ def plot(roll: pd.DataFrame, full: pd.DataFrame, out_path: str | None = None,
     if out_path:
         fig.savefig(out_path, dpi=140)
         print(f"saved -> {out_path}")
-    return fig
+    return _show(fig)
 
 
 # --------------------------------------------------------------------------- #
@@ -367,7 +449,7 @@ def levels(df: pd.DataFrame) -> pd.DataFrame:
 def plot_levels(df: pd.DataFrame, out_path: str | None = None,
                 regimes: dict | None = None,
                 spot: bool = True, log_spot: bool = False,
-                implied: bool = True) -> None:
+                implied: bool = True):
     """Annualised vol per estimator on the left axis, spot on the right.
 
     Implied is drawn heaviest and in black because the quantity of interest is
@@ -381,9 +463,9 @@ def plot_levels(df: pd.DataFrame, out_path: str | None = None,
     passing a window length could only ever mislabel the chart — the smoothing
     already happened in `build(rv_window=...)`.
 
-    Returns the figure, and saves it if `out_path` is given. See `plot` for why
-    the backend is left alone.
+    Returns the figure, and saves it if `out_path` is given.
     """
+    _ensure_inline()
     import matplotlib.pyplot as plt
     from volatility_surface.plots.vol_plots import PALETTE
 
@@ -422,7 +504,7 @@ def plot_levels(df: pd.DataFrame, out_path: str | None = None,
     if out_path:
         fig.savefig(out_path, dpi=140)
         print(f"saved -> {out_path}")
-    return fig
+    return _show(fig)
 
 
 def main() -> None:

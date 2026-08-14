@@ -210,6 +210,34 @@ def regime_table(tables: dict[str, pd.DataFrame],
     return df.round(3)
 
 
+def execution_table(spread: pd.DataFrame, paper: pd.DataFrame,
+                    metrics: tuple[str, ...] = ("Total", "Sharpe")) -> pd.DataFrame:
+    """Side-by-side `results_table`s from the two execution conventions, plus the
+    difference (paper - spread) on each metric.
+
+    This is the table that separates the two competing explanations for a
+    negative Sharpe: no volatility premium at all, versus a premium the crypto
+    option spread eats. If Sharpe stays <=0 under Assumption 5.1's flat 50bp,
+    the spread was never the binding constraint and the premium genuinely is not
+    there. If Sharpe flips positive, the strategy is a real edge that this book
+    is too wide to harvest, and the question becomes execution (limit orders,
+    RFQ, wider roll spacing), not signal.
+
+    Caveat when reading the P&L attribution alongside this: under "spread" the
+    cost is embedded in `option_pnl` (entered at bid/ask, marked at mid), so
+    `option_cost` reads 0. Under "paper" the same economics land in the explicit
+    `option_cost` line. The NET is comparable; the two components are not.
+    """
+    out = {}
+    for m in metrics:
+        out[(m, "spread")] = spread[m]
+        out[(m, "paper")] = paper[m]
+        out[(m, "diff")] = paper[m] - spread[m]
+    df = pd.DataFrame(out)
+    df.columns = pd.MultiIndex.from_tuples(df.columns, names=["metric", "execution"])
+    return df.round(3)
+
+
 def format_table(df: pd.DataFrame) -> str:
     """Percent-format the return/vol/dd columns; keep Sharpe/Skew/beta/R2 raw."""
     out = df.copy()

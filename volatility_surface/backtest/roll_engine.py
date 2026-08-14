@@ -39,15 +39,27 @@ follows the book: N = Pi^BTC under coin, N = Pi^USD/S_t under USD. The paper
 finds risk-adjusted performance is close between the two (§5.2.4) — what really
 changes is beta to the coin.
 
-Execution & marking (more realistic than the paper's Assumption 5.1): each leg
-is TRADED across the real spread — a long leg buys at the ask, a short leg sells
-at the bid — and the open book is MARKED at mid every hedge hour. The half-spread
-cost therefore surfaces automatically in the NAV path the instant a position is
-opened (bought at ask, immediately worth mid), and the hourly mid mark makes the
-NAV continuous so daily vol/Sharpe/MaxDD are meaningful. This replaces the flat
-50bp-on-mid of Assumption 5.1; `option_fee_bps` (default 0) adds any explicit
-exchange fee ON TOP of the spread. Settlement is the intrinsic coin payoff
-(cash-settled, no spread).
+Execution (`execution=`) selects how an option trade is priced. Either way the
+open book is MARKED at mid every hedge hour, which makes the NAV path continuous
+so daily vol/Sharpe/MaxDD are meaningful, and settlement is the intrinsic coin
+payoff (cash-settled, no cost on either convention).
+
+  "spread" (default) — each leg is TRADED across the real book: a long leg buys
+  at the ask, a short leg sells at the bid. The half-spread cost surfaces
+  automatically in the NAV the instant a position is opened (bought at ask,
+  immediately worth mid). More realistic than the paper, and on this data
+  materially more expensive: crypto option spreads are wide.
+
+  "paper" — Assumption 5.1: every leg trades at MID and a flat c = 50bp of the
+  traded mid premium is charged as an explicit cost. Equivalent to executing at
+  mid x (1 +/- 50bp), but booking c as its own `option_cost` line keeps it
+  visible in the P&L attribution instead of buried in the entry price. Use this
+  to ask whether a premium survives once the real spread is replaced by the
+  paper's flat assumption — i.e. how much of the result is spread, not vol.
+
+`option_fee_bps` overrides the cost charged on the traded mid premium under
+either mode (default: 0 under "spread", `OPTION_COST_BPS` = 50 under "paper").
+Set it under "spread" to add an exchange fee ON TOP of the crossed spread.
 
 Funding (Eq 29): pass `funding_series` = a Deribit funding parquet (from
 `utils.deribit_funding.fetch_funding`) for the realised hourly rate charged on
@@ -333,10 +345,14 @@ def _select_leg(expiry_slice: pd.DataFrame, F: float, moneyness, option_type: st
 
 
 def _select_structure(snap: pd.DataFrame, target_expiry_ms: float, legs_spec: list[tuple],
-                      expiry_tol_ms: int = MS_PER_DAY):
+                      expiry_tol_ms: int = MS_PER_DAY, cross_spread: bool = True):
     """Resolve abstract legs to concrete instruments at the roll snapshot.
     Returns None (skip the roll) if the target expiry isn't listed or any leg
-    can't be filled — never open a partial structure."""
+    can't be filled — never open a partial structure.
+
+    `cross_spread=False` fills every leg at mid (Assumption 5.1); the cost is
+    then charged as the flat `opt_fee_frac` on the traded mid premium in `_open`
+    rather than paid through the book."""
     uniq = np.unique(snap["expiration_timestamp_ms"].to_numpy())
     j = int(np.argmin(np.abs(uniq - target_expiry_ms)))
     if abs(uniq[j] - target_expiry_ms) > expiry_tol_ms:
@@ -358,12 +374,17 @@ def _select_structure(snap: pd.DataFrame, target_expiry_ms: float, legs_spec: li
         # ask, a short leg (qty<0) SELLS at the bid. Fall back to mid only if
         # that side of the book is missing. The half-spread cost then surfaces
         # automatically once the position is marked at mid (see `_do_hedge`).
-        bid = float(row.get("bid_price", np.nan))
-        ask = float(row.get("ask_price", np.nan))
-        if qty > 0:
-            entry_exec = ask if (np.isfinite(ask) and ask > 0) else mid
+        # Under Assumption 5.1 (`cross_spread=False`) the book is ignored and
+        # every leg fills at mid — the 50bp is charged separately in `_open`.
+        if not cross_spread:
+            entry_exec = mid
         else:
-            entry_exec = bid if (np.isfinite(bid) and bid > 0) else mid
+            bid = float(row.get("bid_price", np.nan))
+            ask = float(row.get("ask_price", np.nan))
+            if qty > 0:
+                entry_exec = ask if (np.isfinite(ask) and ask > 0) else mid
+            else:
+                entry_exec = bid if (np.isfinite(bid) and bid > 0) else mid
         legs.append({"instrument_id": row["instrument_id"], "strike": float(row["strike"]),
                      "option_type": otype, "qty": float(qty),
                      "expiration_timestamp_ms": float(chosen),
@@ -532,8 +553,10 @@ def _open(state: dict, legs: list[dict], ts_ms: int, spot: float, cfg) -> None:
     for leg in legs:
         leg["contracts"] = leg["qty"] * N
         leg["entry_spot"] = float(spot)
-        # Explicit fee ON TOP of the spread (which is already paid via entry@bid/ask
-        # marked at mid). Defaults to 0 — set option_fee_bps to add exchange fees.
+        # Flat cost on the traded mid premium. Under `execution="paper"` this IS
+        # the transaction cost (c = 50bp, Assumption 5.1), since the legs filled
+        # at mid. Under "spread" it defaults to 0 and sits ON TOP of the spread
+        # already paid via entry@bid/ask marked at mid.
         cost += cfg.opt_fee_frac * abs(leg["contracts"]) * leg["entry_mid"] * _acct(cfg, spot)
     state["cum_pnl"] -= cost
     state["open_legs"] = legs
@@ -577,7 +600,8 @@ def _do_rolls(state: dict, snap: pd.DataFrame, snap_idx: pd.DataFrame, ts_ms: in
             # flat 1-day tolerance. Half-spacing makes the nearest-expiry match
             # unambiguous at every frequency.
             tol = min(MS_PER_DAY, (target_exp - roll_ts) // 2)
-            legs = _select_structure(snap, target_exp, state["legs_spec"], expiry_tol_ms=tol)
+            legs = _select_structure(snap, target_exp, state["legs_spec"], expiry_tol_ms=tol,
+                                     cross_spread=cfg.cross_spread)
             if legs is not None:
                 _open(state, legs, roll_ts, F_perp, cfg)
         state["next_idx"] += 1
@@ -617,7 +641,9 @@ def _finalize(state: dict, cfg) -> dict:
                        "funding_annual_rate": cfg.funding_rate,
                        "option_fee_bps": cfg.opt_fee_frac * 10_000.0,
                        "perp_cost_bps": PERP_COST_BPS, "hedge_band": cfg.hedge_band,
-                       "execution": "bid/ask entry, mid MTM"}}
+                       "execution": cfg.execution,
+                       "execution_detail": ("mid entry + flat fee, mid MTM" if not cfg.cross_spread
+                                            else "bid/ask entry, mid MTM")}}
 
 
 # --------------------------------------------------------------------------- #
@@ -639,7 +665,8 @@ def run_all_strategies(option_path: str, perp_path: str,
                        frequencies: tuple[str, ...] = ("weekly",),
                        initial_coin: float = 1.0, size_multiple: float = 1.0,
                        funding_annual_rate: float = 0.0, funding_series=None,
-                       option_fee_bps: float = 0.0, hedge_band: float = 0.05,
+                       option_fee_bps: float | None = None, hedge_band: float = 0.05,
+                       execution: str = "spread",
                        accounting: str = "coin", initial_usd: float | None = None,
                        start=None, end=None, regime: str | None = None,
                        max_snaps: int | None = None, verbose: bool = True) -> dict[str, dict]:
@@ -659,14 +686,31 @@ def run_all_strategies(option_path: str, perp_path: str,
     churn near expiry and measured at ~18% of gross option P&L on this data; the
     paper itself notes desks rebalance within bands and that "optimised hedging
     produces better risk-adjusted results" (§5.2). Set 0.0 to restore the
-    unconditional hourly rebalance."""
+    unconditional hourly rebalance.
+
+    `execution` (default "spread"): "spread" trades each leg across the real
+    book (long@ask, short@bid) and marks at mid; "paper" applies Assumption 5.1
+    — every leg fills at MID and a flat c = `OPTION_COST_BPS` (50bp) of the
+    traded mid premium is charged instead. Running the same catalog both ways
+    separates "there is no vol premium" from "the premium exists but the crypto
+    option spread eats it". `option_fee_bps` overrides the flat cost under
+    either mode; it defaults to 0 under "spread" and 50 under "paper"."""
     catalog = catalog or build_catalog()
     if accounting not in ("coin", "usd"):
         raise ValueError(f"accounting must be 'coin' or 'usd', got {accounting!r}")
+    if execution not in ("spread", "paper"):
+        raise ValueError(f"execution must be 'spread' or 'paper', got {execution!r}")
+    cross_spread = (execution == "spread")
+    # None means "use this mode's convention"; an explicit 0.0 still means zero,
+    # which is why the default can't just be 0.0 — under "paper" that would
+    # silently run a frictionless book instead of Assumption 5.1.
+    if option_fee_bps is None:
+        option_fee_bps = 0.0 if cross_spread else OPTION_COST_BPS
     cfg = types.SimpleNamespace(initial_coin=initial_coin, size_multiple=size_multiple,
                                 usd=(accounting == "usd"), accounting=accounting,
                                 opt_fee_frac=option_fee_bps / 10_000.0,
                                 perp_cost_frac=PERP_COST_BPS / 10_000.0,
+                                cross_spread=cross_spread, execution=execution,
                                 funding_rate=funding_annual_rate,
                                 funding_fn=_resolve_funding(funding_series),
                                 hedge_band=hedge_band, regime=regime, window=None)
@@ -772,7 +816,8 @@ def run_roll_backtest(option_path: str, perp_path: str,
                       structure: str = "Short Straddle", frequency: str = "weekly",
                       initial_coin: float = 1.0, size_multiple: float = 1.0,
                       funding_annual_rate: float = 0.0, funding_series=None,
-                      option_fee_bps: float = 0.0, hedge_band: float = 0.05,
+                      option_fee_bps: float | None = None, hedge_band: float = 0.05,
+                      execution: str = "spread",
                       accounting: str = "coin", initial_usd: float | None = None,
                       start=None, end=None, regime: str | None = None,
                       max_snaps: int | None = None, verbose: bool = True) -> dict:
@@ -787,7 +832,7 @@ def run_roll_backtest(option_path: str, perp_path: str,
                              frequencies=(frequency,), initial_coin=initial_coin,
                              size_multiple=size_multiple, funding_annual_rate=funding_annual_rate,
                              funding_series=funding_series, option_fee_bps=option_fee_bps,
-                             hedge_band=hedge_band, accounting=accounting,
+                             hedge_band=hedge_band, execution=execution, accounting=accounting,
                              initial_usd=initial_usd, start=start, end=end, regime=regime,
                              max_snaps=max_snaps, verbose=verbose)
     return res[name]

@@ -14,6 +14,10 @@ PYTHONPATH="/Users/macbookair/Internship Natixis" \
 # a single structure:
 ... run_roll.py --options ... --perp ... --structure "Short Straddle" --frequency weekly
 
+# is the premium eaten by the spread, or absent? run both execution conventions
+# (real bid/ask vs the paper's fill-at-mid + flat 50bp) and diff them:
+... run_roll.py --options ... --perp ... --all --frequency weekly --execution both
+
 # quick smoke run on a slice of the data:
 ... run_roll.py --options ... --perp ... --all --max-snaps 5000
 """
@@ -46,8 +50,15 @@ def main() -> None:
     p.add_argument("--funding", default=None,
                    help="path to a Deribit funding parquet (realised hourly Eq 29); "
                         "overrides --funding-annual-rate")
-    p.add_argument("--option-fee-bps", type=float, default=0.0,
-                   help="explicit option fee on top of the bid/ask spread (default 0)")
+    p.add_argument("--option-fee-bps", type=float, default=None,
+                   help="flat cost in bp of the traded mid premium, overriding the "
+                        "execution mode's convention (default: 0 for --execution spread, "
+                        "50 for --execution paper)")
+    p.add_argument("--execution", default="spread", choices=["spread", "paper", "both"],
+                   help="spread = trade across the real book (long@ask, short@bid), mark at "
+                        "mid; paper = Lucic & Sepp Assumption 5.1, fill at mid and charge a "
+                        "flat 50bp of the traded mid premium; both = run each and print the "
+                        "side-by-side comparison (two full passes over the data)")
     p.add_argument("--start", default=None, help="window start, YYYY-MM-DD (UTC)")
     p.add_argument("--end", default=None, help="window end, YYYY-MM-DD (UTC, exclusive)")
     p.add_argument("--regime", default=None,
@@ -71,6 +82,34 @@ def main() -> None:
         print("\n".join(R.catalog_names()))
         return
 
+    if args.execution == "both" and args.regime == "all":
+        p.error("--execution both and --regime all would be one full pass per regime per "
+                "convention; run them separately")
+
+    if args.all and args.execution == "both":
+        freqs = tuple(f.strip() for f in args.frequency.split(","))
+        tables = {}
+        for mode in ("spread", "paper"):
+            print(f"\n--- execution {mode} ---")
+            res = R.run_all_strategies(
+                args.options, args.perp, frequencies=freqs,
+                initial_coin=args.initial_coin, size_multiple=args.size_multiple,
+                funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
+                option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
+                execution=mode, accounting=args.accounting, initial_usd=args.initial_usd,
+                start=args.start, end=args.end, regime=args.regime,
+                max_snaps=args.max_snaps, verbose=not args.quiet)
+            tables[mode] = RR.results_table(res, benchmark_name=args.coin)
+            print()
+            print(RR.format_table(tables[mode]))
+        combined = RR.execution_table(tables["spread"], tables["paper"])
+        print("\n--- spread vs Assumption 5.1 (diff = paper - spread) ---")
+        print(combined.to_string())
+        if args.csv:
+            combined.to_csv(args.csv)
+            print(f"\nsaved table -> {args.csv}")
+        return
+
     if args.all and args.regime == "all":
         # One column block per regime: the point is to see whether a strategy's
         # edge survives a regime it was not selected on.
@@ -82,7 +121,7 @@ def main() -> None:
                 initial_coin=args.initial_coin, size_multiple=args.size_multiple,
                 funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
                 option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
-                accounting=args.accounting, initial_usd=args.initial_usd,
+                execution=args.execution, accounting=args.accounting, initial_usd=args.initial_usd,
                 regime=name, max_snaps=args.max_snaps, verbose=not args.quiet)
             tables[name] = RR.results_table(res, benchmark_name=args.coin)
         combined = RR.regime_table(tables)
@@ -100,7 +139,7 @@ def main() -> None:
             initial_coin=args.initial_coin, size_multiple=args.size_multiple,
             funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
             option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
-            accounting=args.accounting, initial_usd=args.initial_usd,
+            execution=args.execution, accounting=args.accounting, initial_usd=args.initial_usd,
             start=args.start, end=args.end, regime=args.regime,
             max_snaps=args.max_snaps, verbose=not args.quiet)
         table = RR.results_table(results, benchmark_name=args.coin)
@@ -111,16 +150,18 @@ def main() -> None:
             print(f"\nsaved table -> {args.csv}")
         return
 
-    res = R.run_roll_backtest(
-        args.options, args.perp, structure=args.structure, frequency=args.frequency,
-        initial_coin=args.initial_coin, size_multiple=args.size_multiple,
-        funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
-        option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
-        accounting=args.accounting, initial_usd=args.initial_usd,
-        start=args.start, end=args.end, regime=args.regime,
-        max_snaps=args.max_snaps, verbose=not args.quiet)
-    print()
-    RR.print_summary(RR.summarize_rolls(res))
+    modes = ("spread", "paper") if args.execution == "both" else (args.execution,)
+    for mode in modes:
+        res = R.run_roll_backtest(
+            args.options, args.perp, structure=args.structure, frequency=args.frequency,
+            initial_coin=args.initial_coin, size_multiple=args.size_multiple,
+            funding_annual_rate=args.funding_annual_rate, funding_series=args.funding,
+            option_fee_bps=args.option_fee_bps, hedge_band=args.hedge_band,
+            execution=mode, accounting=args.accounting, initial_usd=args.initial_usd,
+            start=args.start, end=args.end, regime=args.regime,
+            max_snaps=args.max_snaps, verbose=not args.quiet)
+        print(f"\n--- execution {mode} ---")
+        RR.print_summary(RR.summarize_rolls(res))
 
 
 if __name__ == "__main__":
